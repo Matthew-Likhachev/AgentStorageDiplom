@@ -1,158 +1,149 @@
 from openpyxl import load_workbook
 from pathlib import Path
 import json
-
-# --- НАСТРОЙКИ ---
-FILE_NAME = 'map1.xlsx'
-FOLDER_NAME = 'maps'
-OUTPUT_FILE = 'map_data.json'  # Файл для сохранения данных
-# -----------------
-
-# 1. Определяем путь к файлу
-script_dir = Path(__file__).parent
-excel_path = script_dir.parent / FOLDER_NAME / FILE_NAME
-
-if not excel_path.exists():
-    print(f"❌ Ошибка: Файл не найден по пути: {excel_path}")
-    exit()
-
-# print(f"✅ Загрузка файла: {excel_path}")
-wb = load_workbook(excel_path, data_only=True)
-ws = wb.active
+from typing import Dict, List, Optional, Tuple
 
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ---
-def get_cell_color_hex(cell):
-    """Возвращает HEX цвет ячейки или None, если цвета нет"""
-    fill = cell.fill
-    if fill.fill_type is None:
-        return None
-    # print(fill.fgColor.type)
-    fg_color = fill.fgColor
-    if fg_color.type != 'rgb':
-        print(fg_color.type)
-        return None
-    # Убираем первые 2 символа (прозрачность)
-    return fg_color.rgb[2:]
+class ExcelLoader:
+    """Загрузчик карты из Excel файла"""
 
+    def __init__(self, folder_name: str = 'maps', file_name: str = 'map1.xlsx'):
+        self.folder_name = folder_name
+        self.file_name = file_name
+        self.map_data = None
+        self.errors = []
 
-# --- 2. НАХОДИМ ГРАНИЦЫ ЧЕРНОГО ПРЯМОУГОЛЬНИКА ---
-# Черный цвет в HEX обычно '000000'
-BLACK_COLOR = '000000'
-START_ROW = 1
-START_COL = 1
-
-# Проверяем, что стартовая ячейка действительно черная
-first_cell_color = get_cell_color_hex(ws.cell(row=START_ROW, column=START_COL))
-if first_cell_color != BLACK_COLOR:
-    print(f"❌ Ошибка: Ячейка A1 не черная (цвет: {first_cell_color})")
-    print("   Скрипт ожидает, что карта начинается с черного прямоугольника.")
-    exit()
-
-# print("🔍 Поиск границ черного прямоугольника...")
-# Находим правую границу (ширину)
-# Идем вправо по первой строке, пока цвет черный
-width = 0
-for col in range(START_COL, ws.max_column + 1):
-    color = get_cell_color_hex(ws.cell(row=START_ROW, column=col))
-    if color == BLACK_COLOR:
-        width += 1
-    else:
-        break
-
-# Находим нижнюю границу (высоту)
-# Идем вниз по первому столбцу, пока цвет черный
-height = 0
-for row in range(START_ROW, ws.max_row + 1):
-    color = get_cell_color_hex(ws.cell(row=row, column=START_COL))
-    if color == BLACK_COLOR:
-        height += 1
-    else:
-        break
-
-# print(f"✅ Найдено: Ширина = {width}, Высота = {height}")
-
-
-# --- 3. ИЗВЛЕКАЕМ ОСНОВНУЮ КАРТУ (ВНУТРЕННОСТЬ ПРЯМОУГОЛЬНИКА) ---
-map_data = {
-    'width': width,
-    'height': height,
-    'start_row': START_ROW,
-    'start_col': START_COL,
-    'cells': []
-}
-
-for row in range(START_ROW, START_ROW + height):
-    row_data = []
-    for col in range(START_COL, START_COL + width):
-        cell = ws.cell(row=row, column=col)
-
-        # Сохраняем ВСЕ данные ячейки
-        cell_info = {
-            'row': row,
-            'col': col,
-            'text': cell.value,
-            'color': get_cell_color_hex(cell)
+        # Цвета клеток
+        self.BLACK_COLOR = '000000'
+        self.COLOR_MAP = {
+            '000000': 'E', 'FF0000': 'W', 'FFFFFF': 'F',
+            'FF9900': 'S', '980000': 'P', '0000FF': 'C',
+            '7030A0': 'Z', 'FFFF00': 'B', '00B050': 'A',
         }
-        row_data.append(cell_info)
-    map_data['cells'].append(row_data)
-# print(f"⏳ Чтение данных карты ({width}x{height})...")
-# main_map = []
-# for row in range(START_ROW, START_ROW + height):
-#     row_data = []
-#     for col in range(START_COL, START_COL + width):
-#         cell = ws.cell(row=row, column=col)
-#         color = get_cell_color_hex(cell)
-#
-#         # Сохраняем цвет (если None - значит без заливки)
-#         row_data.append(color)
-#     main_map.append(row_data)
+
+    def get_excel_path(self) -> Path:
+        """Возвращает полный путь к Excel файлу"""
+        script_dir = Path(__file__).parent
+        return script_dir.parent / self.folder_name / self.file_name
+
+    def load(self) -> bool:
+        """Загружает Excel и парсит в структуру данных"""
+        excel_path = self.get_excel_path()
+
+        if not excel_path.exists():
+            self.errors.append(f"Файл не найден: {excel_path}")
+            return False
+
+        try:
+            wb = load_workbook(excel_path, data_only=True)
+            ws = wb.active
+        except Exception as e:
+            self.errors.append(f"Ошибка открытия Excel: {e}")
+            return False
+
+        # Поиск границ карты
+        start_row, start_col = 1, 1
+        width, height = self._find_map_bounds(ws, start_row, start_col)
+
+        if width == 0 or height == 0:
+            self.errors.append("Не удалось определить размеры карты")
+            return False
+
+        # Парсинг ячеек
+        self.map_data = {
+            'width': width,
+            'height': height,
+            'start_row': start_row,
+            'start_col': start_col,
+            'cells': self._parse_cells(ws, start_row, start_col, width, height)
+        }
+
+        return True
+
+    def _get_cell_color_hex(self, cell) -> Optional[str]:
+        """Возвращает HEX цвет ячейки"""
+        fill = cell.fill
+        if fill.fill_type is None:
+            return None
+        fg_color = fill.fgColor
+        if fg_color.type != 'rgb':
+            return None
+        return fg_color.rgb[2:]
+
+    def _find_map_bounds(self, ws, start_row: int, start_col: int) -> Tuple[int, int]:
+        """Находит ширину и высоту карты по черной рамке"""
+        width = 0
+        for col in range(start_col, ws.max_column + 1):
+            color = self._get_cell_color_hex(ws.cell(row=start_row, column=col))
+            if color == self.BLACK_COLOR:
+                width += 1
+            else:
+                break
+
+        height = 0
+        for row in range(start_row, ws.max_row + 1):
+            color = self._get_cell_color_hex(ws.cell(row=row, column=start_col))
+            if color == self.BLACK_COLOR:
+                height += 1
+            else:
+                break
+
+        return width, height
+
+    def _parse_cells(self, ws, start_row: int, start_col: int, width: int, height: int) -> List[List[Dict]]:
+        """Парсит все ячейки карты"""
+        cells = []
+        for row in range(start_row, start_row + height):
+            row_data = []
+            for col in range(start_col, start_col + width):
+                cell = ws.cell(row=row, column=col)
+                color = self._get_cell_color_hex(cell)
+                text = cell.value
+
+                row_data.append({
+                    'row': row,
+                    'col': col,
+                    'text': text,
+                    'color': color
+                })
+            cells.append(row_data)
+        return cells
+
+    def save_to_json(self, output_file: str = 'map_data.json') -> bool:
+        """Сохраняет данные карты в JSON"""
+        if not self.map_data:
+            self.errors.append("Нет данных для сохранения")
+            return False
+
+        script_dir = Path(__file__).parent
+        output_path = script_dir / output_file
+
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(self.map_data, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            self.errors.append(f"Ошибка сохранения JSON: {e}")
+            return False
+
+    def get_map_data(self) -> Optional[Dict]:
+        """Возвращает данные карты"""
+        return self.map_data
+
+    def get_errors(self) -> List[str]:
+        """Возвращает список ошибок"""
+        return self.errors
 
 
-# --- 4. ВЫВОД ---
-# for row in main_map:
-#     for cell in row:
-#         if cell == '000000':
-#             print('⬛', end=' ')
-#             # print('E', end=' ')
-#         elif cell == 'FF0000':
-#             print('🟥', end=' ')
-#             # print('W', end=' ')
-#         elif cell == 'FFFFFF' or cell == None:
-#             print('⬜', end=' ')
-#             # print('F', end=' ')
-#         elif cell == 'FF9900':
-#             print('🟧', end=' ')
-#             # print('S', end=' ')
-#         elif cell == '980000':
-#             print('⚛️', end=' ')
-#             # print('P', end=' ')
-#         elif cell == '0000FF':
-#             print('🟦', end=' ')
-#             # print('C', end=' ')
-#         elif cell == '7030A0':
-#             print('🟪', end=' ')
-#             # print('Z', end=' ')
-#         elif cell == 'FFFF00':
-#             print('🟨', end=' ')
-#             # print('B', end=' ')
-#         elif cell == '00B050':
-#             print('🟩', end=' ')
-#             # print('A', end=' ')
-#         else:
-#             print('Error', end = ' ')
-#             # print('Error', end=' ')
-#     print()
-    # print(row)
-# Пример: вывести размер полученной карты
-# print(f"📊 Размер основной карты: {len(main_map)} строк * {len(main_map[0])} столбцов")
 
-# --- 4. СОХРАНЯЕМ В JSON ---
-output_path = script_dir / OUTPUT_FILE
-with open(output_path, 'w', encoding='utf-8') as f:
-    json.dump(map_data, f, ensure_ascii=False, indent=2)
-
-# --- 5. Валидация ---
-# validator = mapvalidator.MapValidator(ws, START_ROW, START_COL, height, width)
-# is_valid = validator.validate()
-# print(is_valid)
+# Для обратной совместимости (если кто-то запускает напрямую)
+if __name__ == "__main__":
+    loader = ExcelLoader()
+    if loader.load():
+        print(f"✅ Карта загружена: {loader.map_data['width']}x{loader.map_data['height']}")
+        if loader.save_to_json():
+            print("✅ Данные сохранены в map_data.json")
+    else:
+        print("❌ Ошибки загрузки:")
+        for err in loader.get_errors():
+            print(f"  - {err}")

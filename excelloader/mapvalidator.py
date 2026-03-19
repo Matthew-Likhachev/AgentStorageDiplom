@@ -1,34 +1,23 @@
 from pathlib import Path
 import json
-
-# --- НАСТРОЙКИ ---
-INPUT_FILE = 'map_data.json'
-OUTPUT_FILE = 'map_data_fixed.json'  # Файл с исправленными данными
-AUTO_FIX = True  # Включить автоисправление
-# -----------------
-
-script_dir = Path(__file__).parent
-input_path = script_dir / INPUT_FILE
-output_path = script_dir / OUTPUT_FILE
-
-if not input_path.exists():
-    print(f"❌ Ошибка: Файл данных не найден: {input_path}")
-    print("   Сначала запустите load_map.py для создания файла данных.")
-    exit()
+from typing import Dict, List, Optional, Tuple
 
 
 class MapValidator:
-    def __init__(self, map_data, auto_fix=True):
+    """Валидатор данных карты"""
+
+    def __init__(self, map_data: Dict, auto_fix: bool = True):
         self.map_data = map_data
-        self.width = map_data['width']
-        self.height = map_data['height']
-        self.start_row = map_data['start_row']
-        self.start_col = map_data['start_col']
-        self.cells = map_data['cells']
+        self.auto_fix = auto_fix
         self.errors = []
         self.warnings = []
         self.fixed_count = 0
-        self.auto_fix = auto_fix
+
+        self.width = map_data.get('width', 0)
+        self.height = map_data.get('height', 0)
+        self.start_row = map_data.get('start_row', 1)
+        self.start_col = map_data.get('start_col', 1)
+        self.cells = map_data.get('cells', [])
 
         self.COLOR_MAP = {
             '000000': 'E', 'FF0000': 'W', 'FFFFFF': 'F',
@@ -39,7 +28,7 @@ class MapValidator:
         self.DIRECTIONS = ['n', 'w', 's', 'e']
         self.DIR_OFFSETS = {'n': (-1, 0), 's': (1, 0), 'w': (0, -1), 'e': (0, 1)}
 
-    def parse_cell_text(self, cell_info):
+    def parse_cell_text(self, cell_info: Dict) -> Tuple[Optional[Dict], Optional[str]]:
         """Парсит текст ячейки"""
         text = cell_info.get('text')
         row, col = cell_info['row'], cell_info['col']
@@ -94,23 +83,22 @@ class MapValidator:
             'original_text': text
         }, None
 
-    def format_directions(self, dirs_dict):
-        """Преобразует словарь направлений обратно в строку формата n-w-s-e"""
+    def format_directions(self, dirs_dict: Dict) -> str:
+        """Преобразует словарь направлений в строку"""
         result = []
         for dir_char in self.DIRECTIONS:
             result.append(dirs_dict.get(dir_char, '-'))
             result.append('-')
-        return ''.join(result[:-1])  # Убираем последний дефис
+        return ''.join(result[:-1])
 
-    def update_cell_text(self, cell_info, cell_data):
-        """Обновляет текст ячейки в исходных данных"""
+    def update_cell_text(self, cell_info: Dict, cell_data: Dict) -> str:
+        """Обновляет текст ячейки"""
         loaded_str = self.format_directions(cell_data['loaded_dirs'])
         empty_str = self.format_directions(cell_data['empty_dirs'])
         logic_str = json.dumps(cell_data['logic'], ensure_ascii=False) if cell_data['logic'] else '{}'
 
         new_text = f"{cell_data['type']}|{loaded_str}|{empty_str}|{logic_str}"
 
-        # Находим и обновляем ячейку в исходных данных
         r_idx = cell_info['row'] - self.start_row
         c_idx = cell_info['col'] - self.start_col
         self.cells[r_idx][c_idx]['text'] = new_text
@@ -118,22 +106,18 @@ class MapValidator:
 
         return new_text
 
-    def get_cell_info(self, row, col):
-        """Получает информацию о ячейке по координатам"""
+    def get_cell_info(self, row: int, col: int) -> Optional[Dict]:
+        """Получает информацию о ячейке"""
         r_idx = row - self.start_row
         c_idx = col - self.start_col
         if 0 <= r_idx < self.height and 0 <= c_idx < self.width:
             return self.cells[r_idx][c_idx]
         return None
 
-    def get_neighbor(self, row, col, direction):
+    def get_neighbor(self, row: int, col: int, direction: str) -> Optional[Dict]:
         """Возвращает соседнюю ячейку"""
         dr, dc = self.DIR_OFFSETS[direction]
         new_row, new_col = row + dr, col + dc
-
-        if not (self.start_row <= new_row < self.start_row + self.height and
-                self.start_col <= new_col < self.start_col + self.width):
-            return None
 
         cell_info = self.get_cell_info(new_row, new_col)
         if cell_info:
@@ -141,11 +125,11 @@ class MapValidator:
             return cell_data
         return None
 
-    def validate_cell_format(self):
-        print("🔍 Проверка формата ячеек...")
+    def validate_cell_format(self) -> int:
+        """Проверяет формат ячеек"""
         valid_count = 0
 
-        for row_idx, row_data in enumerate(self.cells):
+        for row_data in self.cells:
             for cell_info in row_data:
                 cell_data, error = self.parse_cell_text(cell_info)
 
@@ -161,13 +145,11 @@ class MapValidator:
                             f"Ячейка ({cell_info['row']},{cell_info['col']}): тип '{cell_data['type']}' не соответствует цвету {color}"
                         )
 
-        print(f"   ✅ Проверено {valid_count} ячеек")
+        return valid_count
 
     def validate_movement_rules(self):
-        """Проверяет и ИСПРАВЛЯЕТ правила движения"""
-        print("🔍 Проверка правил движения..." + (" (с автоисправлением)" if self.auto_fix else ""))
-
-        for row_idx, row_data in enumerate(self.cells):
+        """Проверяет и исправляет правила движения"""
+        for row_data in self.cells:
             for cell_info in row_data:
                 cell_data, _ = self.parse_cell_text(cell_info)
                 if not cell_data:
@@ -184,80 +166,72 @@ class MapValidator:
                     neighbor_type = neighbor['type']
                     fixed = False
 
-                    # 1. Нельзя в черные (E) и красные (W)
+                    # Нельзя в черные (E) и красные (W)
                     if neighbor_type in ['E', 'W']:
                         if cell_data['loaded_dirs'][direction] != '-':
-                            msg = f"Ячейка ({row},{col}): закрыто движение с грузом в {neighbor_type} ({neighbor['row']},{neighbor['col']}) направление {direction}"
                             if self.auto_fix:
                                 cell_data['loaded_dirs'][direction] = '-'
                                 modified = True
                                 fixed = True
                             else:
-                                self.errors.append(msg.replace("закрыто", "разрешено"))
+                                self.errors.append(
+                                    f"Ячейка ({row},{col}): разрешено движение с грузом в {neighbor_type}")
 
                         if cell_data['empty_dirs'][direction] != '-':
-                            msg = f"Ячейка ({row},{col}): закрыто движение без груза в {neighbor_type} ({neighbor['row']},{neighbor['col']}) направление {direction}"
                             if self.auto_fix:
                                 cell_data['empty_dirs'][direction] = '-'
                                 modified = True
                                 fixed = True
                             else:
-                                self.errors.append(msg.replace("закрыто", "разрешено"))
+                                self.errors.append(
+                                    f"Ячейка ({row},{col}): разрешено движение без груза в {neighbor_type}")
 
-                    # 2. Нельзя с грузом в полки (S) и зарядки (C)
+                    # Нельзя с грузом в полки (S) и зарядки (C)
                     if neighbor_type in ['S', 'C']:
                         if cell_data['loaded_dirs'][direction] != '-':
-                            msg = f"Ячейка ({row},{col}): закрыто движение С ГРУЗОМ в {neighbor_type} ({neighbor['row']},{neighbor['col']}) направление {direction}"
                             if self.auto_fix:
                                 cell_data['loaded_dirs'][direction] = '-'
                                 modified = True
                                 fixed = True
                             else:
-                                self.errors.append(msg.replace("закрыто", "разрешено"))
+                                self.errors.append(
+                                    f"Ячейка ({row},{col}): разрешено движение с грузом в {neighbor_type}")
 
-                    # 3. Нельзя в фасовщика (P)
+                    # Нельзя в фасовщика (P)
                     if neighbor_type == 'P':
                         if cell_data['loaded_dirs'][direction] != '-':
-                            msg = f"Ячейка ({row},{col}): закрыт заезд с грузом в фасовщика P ({neighbor['row']},{neighbor['col']}) направление {direction}"
                             if self.auto_fix:
                                 cell_data['loaded_dirs'][direction] = '-'
                                 modified = True
                                 fixed = True
                             else:
-                                self.errors.append(msg.replace("закрыт", "разрешён"))
+                                self.errors.append(f"Ячейка ({row},{col}): разрешён заезд с грузом в фасовщика")
 
                         if cell_data['empty_dirs'][direction] != '-':
-                            msg = f"Ячейка ({row},{col}): закрыт заезд без груза в фасовщика P ({neighbor['row']},{neighbor['col']}) направление {direction}"
                             if self.auto_fix:
                                 cell_data['empty_dirs'][direction] = '-'
                                 modified = True
                                 fixed = True
                             else:
-                                self.errors.append(msg.replace("закрыт", "разрешён"))
+                                self.errors.append(f"Ячейка ({row},{col}): разрешён заезд без груза в фасовщика")
 
-                    # 4. Нельзя без груза в зону заказа (Z, slot 1-10)
+                    # Нельзя без груза в зону заказа (Z, slot 1-10)
                     if neighbor_type == 'Z':
                         slot = neighbor['logic'].get('slot', 0)
                         if 1 <= slot <= 10:
                             if cell_data['empty_dirs'][direction] != '-':
-                                msg = f"Ячейка ({row},{col}): закрыт заезд БЕЗ ГРУЗА в зону заказа Z slot={slot} ({neighbor['row']},{neighbor['col']}) направление {direction}"
                                 if self.auto_fix:
                                     cell_data['empty_dirs'][direction] = '-'
                                     modified = True
                                     fixed = True
                                 else:
-                                    self.errors.append(msg.replace("закрыт", "разрешён"))
+                                    self.errors.append(f"Ячейка ({row},{col}): разрешён заезд без груза в зону заказа")
 
-                    if fixed:
-                        print(f"   🔧 Исправлено: {msg}")
-
-                # Сохраняем изменения в ячейке
                 if modified and self.auto_fix:
                     self.update_cell_text(cell_info, cell_data)
 
-    def validate_special_rules(self):
-        print("🔍 Проверка специальных правил...")
-
+    def validate_special_rules(self) -> Dict:
+        """Проверяет специальные правила (уникальность ID)"""
         packer_ids, charger_ids, shelf_ids = set(), set(), set()
 
         for row_data in self.cells:
@@ -270,96 +244,81 @@ class MapValidator:
                 cell_type = cell_data['type']
                 row, col = cell_info['row'], cell_info['col']
 
-                if cell_type == 'P' and 'packer_id' in logic:
-                    pid = logic['packer_id']
+                if cell_type == 'P' and 'packer' in logic:
+                    pid = logic['packer']
                     if pid in packer_ids:
-                        self.errors.append(f"Ячейка ({row},{col}): дублирующийся packer_id={pid}")
+                        self.errors.append(f"Ячейка ({row},{col}): дублирующийся packer={pid}")
                     packer_ids.add(pid)
 
-                if cell_type == 'C' and 'charger_id' in logic:
-                    cid = logic['charger_id']
+                if cell_type == 'C' and 'charger' in logic:
+                    cid = logic['charger']
                     if cid in charger_ids:
-                        self.errors.append(f"Ячейка ({row},{col}): дублирующийся charger_id={cid}")
+                        self.errors.append(f"Ячейка ({row},{col}): дублирующийся charger={cid}")
                     charger_ids.add(cid)
 
-                if cell_type == 'S' and 'shelf_id' in logic:
-                    sid = logic['shelf_id']
+                if cell_type == 'S' and 'shelf' in logic:
+                    sid = logic['shelf']
                     if sid in shelf_ids:
-                        self.errors.append(f"Ячейка ({row},{col}): дублирующийся shelf_id={sid}")
+                        self.errors.append(f"Ячейка ({row},{col}): дублирующийся shelf={sid}")
                     shelf_ids.add(sid)
 
-                if cell_type == 'P' and not logic.get('packer_id'):
-                    self.errors.append(f"Ячейка ({row},{col}): фасовщик без packer_id")
+        return {
+            'packers': len(packer_ids),
+            'chargers': len(charger_ids),
+            'shelves': len(shelf_ids)
+        }
 
-        print(f"   Найдено фасовщиков: {len(packer_ids)}, зарядок: {len(charger_ids)}, полок: {len(shelf_ids)}")
-
-    def save_fixed_data(self):
-        """Сохраняет исправленные данные в новый файл"""
+    def save_fixed_data(self, output_file: str = 'map_data_fixed.json') -> bool:
+        """Сохраняет исправленные данные"""
         if self.auto_fix and self.fixed_count > 0:
             self.map_data['cells'] = self.cells
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(self.map_data, f, ensure_ascii=False, indent=2)
-            print(f"\n💾 Исправленные данные сохранены в: {output_path}")
+            script_dir = Path(__file__).parent
+            output_path = script_dir / output_file
 
-    def validate(self):
-        print("\n" + "=" * 70)
-        print("ЗАПУСК ВАЛИДАТОРА КАРТЫ" + (" (АВТОИСПРАВЛЕНИЕ ВКЛЮЧЕНО)" if self.auto_fix else ""))
-        print("=" * 70)
+            try:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.map_data, f, ensure_ascii=False, indent=2)
+                return True
+            except Exception:
+                return False
+        return False
 
-        self.validate_cell_format()
+    def validate(self) -> bool:
+        """Запускает полную валидацию"""
+        valid_count = self.validate_cell_format()
         self.validate_movement_rules()
-        self.validate_special_rules()
-
-        # Сохраняем исправления
+        stats = self.validate_special_rules()
         self.save_fixed_data()
 
-        print("\n" + "=" * 70)
-        print("РЕЗУЛЬТАТЫ ВАЛИДАЦИИ")
-        print("=" * 70)
+        return len(self.errors) == 0
 
-        if self.errors:
-            print(f"\n❌ ОШИБКИ ({len(self.errors)}):")
-            for i, error in enumerate(self.errors[:20], 1):
-                print(f"   {i}. {error}")
-            if len(self.errors) > 20:
-                print(f"   ... и еще {len(self.errors) - 20} ошибок")
-
-        if self.warnings:
-            print(f"\n⚠️  ПРЕДУПРЕЖДЕНИЯ ({len(self.warnings)}):")
-            for i, warning in enumerate(self.warnings[:10], 1):
-                print(f"   {i}. {warning}")
-            if len(self.warnings) > 10:
-                print(f"   ... и еще {len(self.warnings) - 10} предупреждений")
-
-        if self.auto_fix:
-            print(f"\n🔧 ИСПРАВЛЕНО: {self.fixed_count} ячеек")
-
-        if not self.errors and not self.warnings:
-            print("\n✅ Карта валидна! Ошибок и предупреждений не найдено.")
-        elif not self.errors:
-            print(f"\n✅ Карта валидна! Найдено {len(self.warnings)} предупреждений.")
-        else:
-            print(f"\n❌ Карта содержит {len(self.errors)} ошибок. Требуется исправление.")
-
-        print("=" * 70 + "\n")
-
-        # Возвращаем True если нет критических ошибок (или всё исправлено)
-        return len(self.errors) == 0 if not self.auto_fix else True
+    def get_report(self) -> Dict:
+        """Возвращает отчет о валидации"""
+        return {
+            'errors': self.errors,
+            'warnings': self.warnings,
+            'fixed_count': self.fixed_count,
+            'is_valid': len(self.errors) == 0
+        }
 
 
-# ============================================================================
-# ======================== ЗАПУСК ВАЛИДАТОРА =================================
-# ============================================================================
-
+# Для обратной совместимости
 if __name__ == "__main__":
+    script_dir = Path(__file__).parent
+    input_path = script_dir / 'map_data.json'
+
+    if not input_path.exists():
+        print("❌ Файл map_data.json не найден")
+        exit(1)
+
     with open(input_path, 'r', encoding='utf-8') as f:
         map_data = json.load(f)
 
-    print(f"📂 Загружены данные карты: {map_data['width']}x{map_data['height']}")
-    print(f"🔧 Автоисправление: {'ВКЛЮЧЕНО' if AUTO_FIX else 'ВЫКЛЮЧЕНО'}\n")
-
-    validator = MapValidator(map_data, auto_fix=AUTO_FIX)
+    validator = MapValidator(map_data, auto_fix=True)
     is_valid = validator.validate()
+    report = validator.get_report()
 
-    if not is_valid and not AUTO_FIX:
-        exit(1)
+    print(f"\n✅ Валидация завершена")
+    print(f"   Ошибок: {len(report['errors'])}")
+    print(f"   Предупреждений: {len(report['warnings'])}")
+    print(f"   Исправлено: {report['fixed_count']} ячеек")
