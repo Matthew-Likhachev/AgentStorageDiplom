@@ -138,7 +138,7 @@ class ExcelLoader:
 
 # Для обратной совместимости (если кто-то запускает напрямую)
 if __name__ == "__main__":
-    loader = ExcelLoader()
+    loader = ExcelLoader(file_name='map1.xlsx')
     if loader.load():
         print(f"✅ Карта загружена: {loader.map_data['width']}x{loader.map_data['height']}")
         if loader.save_to_json():

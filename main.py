@@ -1,11 +1,12 @@
 import starter
+import simulation.map_viewer
 
 from excelloader.excelloader import ExcelLoader
 from excelloader.mapvalidator import MapValidator
 
-def validation():
+def validation(file_name):
     # Загрузка
-    loader = ExcelLoader(folder_name='maps', file_name='map3.xlsx')
+    loader = ExcelLoader(folder_name='maps', file_name=file_name)
     if not loader.load():
         print("❌ Ошибки:", loader.get_errors())
         return 1
@@ -21,5 +22,6 @@ def validation():
 
 if __name__ == "__main__":
    # starter.main()
-   validation()
+   validation(file_name = 'map1.xlsx')
+   simulation.map_viewer.main()
 
