@@ -639,7 +639,7 @@ def main():
 
     # Загрузка
     print_header("1. Загрузка карты")
-    loader = ExcelLoader(folder_name='maps', file_name='map3.xlsx')
+    loader = ExcelLoader(folder_name='maps', file_name='map1.xlsx')
     if not loader.load():
         print("❌ Ошибки:", loader.get_errors());
         return 1

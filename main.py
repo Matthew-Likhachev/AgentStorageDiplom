@@ -23,5 +23,5 @@ def validation(file_name):
 if __name__ == "__main__":
    # starter.main()
    validation(file_name = 'map1.xlsx')
-   simulation.map_viewer.main()
+   simulation.map_viewer.main(json_path="A:\projects in programming\python\AgentStorage\AgentStorageDiplom\excelloader\map_data_fixed.json")
 

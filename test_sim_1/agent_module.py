@@ -1,0 +1,743 @@
+"""
+agent_module.py
+Centralized Orchestration + Intelligent Priority Score
+
+Изменения:
+  - AStarRouter удалён отсюда — теперь в router_interface.py (BaseGridRouter).
+  - AgentManager использует любой IRouter через инъекцию зависимостей.
+  - DeadlockResolver: IDLE/UNLOADING/WAITING_SLOT не считаются застрявшими.
+  - Swap-конфликты решаются на уровне A* (_is_swap) и DeadlockResolver.
+"""
+
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+
+try:
+    from router_interface import IRouter, BaseGridRouter
+except ImportError:
+    class IRouter:
+        def solve(self, tasks, reservations): raise NotImplementedError
+    BaseGridRouter = IRouter
+
+try:
+    from deadlock_module import DeadlockResolver
+except ImportError:
+    class DeadlockResolver:
+        def __init__(self, **kw): pass
+        def update_last_move(self, agents, tick): pass
+        def check_and_resolve(self, agents, res, tick): return {aid: "OK" for aid in agents}
+
+# ── Статусы ──────────────────────────────────────────────────────────────────
+STATUS_IDLE            = "IDLE"
+STATUS_GO_TO_SHELF     = "GO_TO_SHELF"
+STATUS_CARRY_TO_PACKER = "CARRY_TO_PACKER"
+STATUS_WAITING_SLOT    = "WAITING_SLOT"
+STATUS_UNLOADING       = "UNLOADING"
+STATUS_RETURN_SHELF    = "RETURN_SHELF"
+
+SCORE_WEIGHTS = {'w1': 3.0, 'w2': 2.0, 'w3': 5.0, 'w4': 1.0, 'w5': 2.0}
+
+
+# ── Agent ────────────────────────────────────────────────────────────────────
+class Agent:
+    def __init__(self, agent_id: int, start_pos: Tuple[int, int]):
+        self.id                  = agent_id
+        self.pos                 = start_pos
+        self.start_pos           = start_pos
+        self.status              = STATUS_IDLE
+        self.goal: Optional[Tuple[int, int]] = None
+        self.path: List[Tuple[int, int]]     = []
+        self.current_path_index  = 0
+        self.waiting_time        = 0
+        self.urgency             = 1
+        self.score               = 0.0
+        self.shortest_path_len   = 0
+        self.current_suborder    = None
+        self.has_cargo           = False
+        self.unload_timer        = 0
+        self.original_shelf_pos: Optional[Tuple[int, int]] = None
+        self.assigned_slot_num:  Optional[int]             = None
+        # Реальный диаметр карты (width + height). Устанавливается AgentManager
+        # при создании агента. До установки используется безопасное значение 200.
+        self.map_max_dist: int = 200
+
+    def compute_score(self, actual_path_len: int = 0) -> float:
+        w           = SCORE_WEIGHTS
+        slot        = self.assigned_slot_num or 10
+        urgency     = max(1, min(10, 11 - slot))
+        wt          = min(self.waiting_time, 1000)
+        prio        = self.current_suborder.priority if self.current_suborder else 1
+        criticality = max(1, min(4, 1 + (prio - 1) * 3 // 9))
+        dist        = (abs(self.pos[0] - self.goal[0]) + abs(self.pos[1] - self.goal[1])
+                       if self.goal else self.map_max_dist)
+
+        # ИСПРАВЛЕНИЕ: нормируем proximity на реальный диаметр карты
+        # (width + height), а не на площадь сетки (10000).
+        # Старое: proximity = max(1, 10000 - dist) / 10000  → макс ~0.0001 (мёртво)
+        # Новое: 1.0 - dist/max_dist → диапазон [0.0, 1.0], реально влияет на score
+        max_dist      = max(1, self.map_max_dist)
+        proximity_norm = max(0.0, min(1.0, 1.0 - dist / max_dist))
+
+        shortest    = self.shortest_path_len or dist
+        if actual_path_len > 0 and shortest > 0:
+            detour = max(0.0, min(1.0,
+                (actual_path_len - shortest) / max(1, max_dist - shortest)))
+        else:
+            detour = 0.0
+
+        # ИСПРАВЛЕНИЕ: detour со знаком ПЛЮС.
+        # Прежний знак минус создавал отрицательную петлю: агент уже заплатил
+        # за обход → score падал → приоритет снижался → его снова заставляли
+        # уступать → новый обход → score ещё ниже. Знак плюс: агент, вынужденный
+        # делать крюк, накапливает «долг» системы и получает приоритет вернуть его.
+        self.score = (w['w1'] * (urgency / 10.0)
+                      + w['w2'] * (wt / 1000.0)
+                      + w['w3'] * (criticality / 4.0)
+                      + w['w4'] * proximity_norm
+                      + w['w5'] * detour)
+        return self.score
+
+    def move(self) -> Tuple[int, int]:
+        if not self.path or self.current_path_index >= len(self.path):
+            return self.pos
+        self.pos = self.path[self.current_path_index]
+        self.current_path_index += 1
+        if self.current_path_index >= len(self.path):
+            self.path = []; self.current_path_index = 0
+        return self.pos
+
+
+# ── PackerSlotManager ────────────────────────────────────────────────────────
+class PackerSlotManager:
+    """
+    Управляет Z-слотами очереди фасовщика.
+
+    АРХИТЕКТУРА КОНВОЯ:
+      • Каждый слот — эксклюзивная физическая ячейка. Зарезервирована для
+        конкретного агента в reservations: никто другой не может в неё войти.
+      • Агенты двигаются вереницей: слот N → N-1 только когда позиция N-1
+        физически пуста (предыдущий агент ушёл) И агент N физически стоит
+        в своём слоте (WAITING_SLOT).
+      • Последний слот (максимальный номер): когда освобождается, в него
+        может войти первый агент СЛЕДУЮЩЕГО подзаказа (его номер в подзаказе=1,
+        но в очереди он на последней позиции). Это обеспечивает непрерывный
+        поток к фасовщику.
+
+    slot_owners[pid][slot_num] = agent_id | None
+    slot_suborder[pid][slot_num] = suborder_id | None
+    slots[pid][slot_num] = (row, col)  — физическая позиция
+    """
+    def __init__(self, map_data: Dict):
+        import json as _json
+        self.slots:         Dict[int, Dict[int, Tuple[int, int]]] = {}
+        self.slot_owners:   Dict[int, Dict[int, Optional[int]]]   = {}
+        self.slot_suborder: Dict[int, Dict[int, Optional[int]]]   = {}
+
+        for row in map_data.get('cells', []):
+            for c in row:
+                if c.get('type') != 'Z': continue
+                parts = c.get('text', '').split('|')
+                try:
+                    logic    = _json.loads(parts[3]) if len(parts) > 3 else {}
+                    pid      = logic.get('packer_id')
+                    slot_num = logic.get('slot')
+                    zone     = logic.get('zone', 'order')
+                    if pid is None or slot_num is None or zone != 'order': continue
+                    self.slots.setdefault(pid, {})[slot_num]          = (c['row'], c['col'])
+                    self.slot_owners.setdefault(pid, {})[slot_num]    = None
+                    self.slot_suborder.setdefault(pid, {})[slot_num]  = None
+                except Exception:
+                    pass
+
+        for pid, s in self.slots.items():
+            logging.info(f"  Фасовщик {pid}: {len(s)} Z-слотов {sorted(s.keys())}")
+
+    def total_slots(self, packer_id: int) -> int:
+        return len(self.slots.get(packer_id, {}))
+
+    def free_slots_count(self, packer_id: int) -> int:
+        return sum(1 for v in self.slot_owners.get(packer_id, {}).values() if v is None)
+
+    def last_slot_num(self, packer_id: int) -> Optional[int]:
+        s = self.slots.get(packer_id, {})
+        return max(s.keys()) if s else None
+
+    def last_slot_free(self, packer_id: int) -> bool:
+        last = self.last_slot_num(packer_id)
+        if last is None: return False
+        return self.slot_owners.get(packer_id, {}).get(last) is None
+
+    def acquire_last_slot(self, packer_id: int, agent_id: int,
+                          suborder_id: Optional[int] = None
+                          ) -> Optional[Tuple[int, Tuple[int, int]]]:
+        """Занимает последний (максимальный) слот — для агентов следующего подзаказа."""
+        last = self.last_slot_num(packer_id)
+        if last is None: return None
+        owners = self.slot_owners.get(packer_id, {})
+        if owners.get(last) is not None: return None
+        owners[last] = agent_id
+        self.slot_suborder[packer_id][last] = suborder_id
+        return last, self.slots[packer_id][last]
+
+    def acquire_slot(self, packer_id: int, agent_id: int,
+                     suborder_id: Optional[int] = None
+                     ) -> Optional[Tuple[int, Tuple[int, int]]]:
+        """
+        Занимает наибольший свободный слот (новый агент — в конец очереди).
+        Используется только для агентов ТЕКУЩЕГО подзаказа.
+        """
+        owners = self.slot_owners.get(packer_id, {})
+        free_slots = sorted([sn for sn, oid in owners.items() if oid is None], reverse=True)
+        if not free_slots: return None
+        sn = free_slots[0]
+        owners[sn] = agent_id
+        self.slot_suborder[packer_id][sn] = suborder_id
+        return sn, self.slots[packer_id][sn]
+
+    def release_slot(self, packer_id: int, slot_num: int):
+        owners = self.slot_owners.get(packer_id, {})
+        if slot_num in owners:
+            owners[slot_num] = None
+            self.slot_suborder[packer_id][slot_num] = None
+
+    def get_agent_slot(self, packer_id: int, agent_id: int) -> Optional[int]:
+        for sn, aid in self.slot_owners.get(packer_id, {}).items():
+            if aid == agent_id: return sn
+        return None
+
+    def slot_1_free(self, packer_id: int) -> bool:
+        return self.slot_owners.get(packer_id, {}).get(1) is None
+
+    def get_exclusive_reservations(self) -> Dict:
+        """
+        Возвращает словарь резерваций для всех занятых слотов.
+        Формат совместим с reservations AgentManager:
+          {pos: [{'agent_id': owner_id, 't_start': 0, 't_end': 0}]}
+        Это означает: позиция слота постоянно занята для всех КРОМЕ owner_id.
+        Передаётся роутеру — A* не прокладывает пути других агентов через эти клетки.
+        """
+        res: Dict = {}
+        for pid, slot_dict in self.slots.items():
+            for sn, pos in slot_dict.items():
+                owner = self.slot_owners.get(pid, {}).get(sn)
+                if owner is not None:
+                    res.setdefault(pos, []).append(
+                        {'agent_id': owner, 't_start': 0, 't_end': 0})
+        return res
+
+
+# ── AgentManager ─────────────────────────────────────────────────────────────
+class AgentManager:
+    def __init__(self, env, router: IRouter, map_data: Dict,
+                 dispatcher=None, inventory=None,
+                 packer_positions=None, packer_delivery_zones=None,
+                 num_agents: int = 2):
+        self.env                   = env
+        self.router                = router
+        self.dispatcher            = dispatcher
+        self.inventory             = inventory
+        self.packer_positions      = packer_positions      or {}
+        self.packer_delivery_zones = packer_delivery_zones or {}
+        self.num_agents            = num_agents
+        self.agents: Dict[int, Agent] = {}
+        self.current_tick          = 0
+
+        self.reservations: Dict = {}  # сохраняется между тиками
+        self.shelf_states: Dict[Tuple[int, int], str] = {}
+        # Тик когда стеллаж был возвращён. Не назначается агентам
+        # пока current_tick < cooldown_until, чтобы оранжевый был виден ≥N тиков.
+        self._shelf_cooldown: Dict[Tuple[int, int], int] = {}
+        self._SHELF_COOLDOWN_TICKS = 3   # минимум тиков оранжевого
+        for row in map_data.get('cells', []):
+            for c in row:
+                if c['type'] == 'S':
+                    self.shelf_states[(c['row'], c['col'])] = 'ACTIVE'
+
+        self.slot_manager      = PackerSlotManager(map_data)
+        self.deadlock_resolver = DeadlockResolver(stuck_threshold=8, map_data=map_data)
+
+        if self.dispatcher and hasattr(self.dispatcher, 'packer_slots'):
+            for pid in self.slot_manager.slots:
+                self.dispatcher.packer_slots[pid] = self.slot_manager.total_slots(pid)
+                logging.info(f"  Диспетчер: фасовщик {pid} = "
+                             f"{self.dispatcher.packer_slots[pid]} слотов")
+
+        self._init_agents(map_data)
+        logging.info(f"🤖 Агентов: {len(self.agents)} | "
+                     f"Стеллажей: {len(self.shelf_states)}")
+
+    def _init_agents(self, map_data: Dict):
+        restricted: set = set()
+        for row in map_data.get('cells', []):
+            for c in row:
+                t = c.get('type', '')
+                if t in ('Z', 'B', 'P', 'C', 'E', 'W', 'S'):
+                    restricted.add((c['row'], c['col']))
+                    if t in ('P', 'Z'):
+                        for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                            restricted.add((c['row']+dr, c['col']+dc))
+        a_pos = [(c['row'], c['col'])
+                 for row in map_data.get('cells', [])
+                 for c in row if c.get('text', '').startswith('A|')]
+        occupied = set(a_pos)
+        f_safe = [(c['row'], c['col'])
+                  for row in map_data.get('cells', [])
+                  for c in row
+                  if c.get('type') == 'F'
+                  and (c['row'], c['col']) not in occupied
+                  and (c['row'], c['col']) not in restricted]
+        f_any  = [(c['row'], c['col'])
+                  for row in map_data.get('cells', [])
+                  for c in row
+                  if c.get('type') == 'F'
+                  and (c['row'], c['col']) not in occupied]
+        pool, seen = [], set()
+        for p in (a_pos + f_safe + f_any):
+            if p not in seen:
+                seen.add(p); pool.append(p)
+        spawn = pool[:self.num_agents]
+        if not spawn:
+            spawn = [(10, 10)] * self.num_agents
+        # Реальный диаметр карты (манхэттен угол→угол = width + height)
+        _map_max_dist = map_data.get('width', 100) + map_data.get('height', 100)
+        for i, pos in enumerate(spawn, start=1):
+            self.agents[i] = Agent(i, pos)
+            self.agents[i].map_max_dist = _map_max_dist
+            logging.info(f"  Агент {i} → старт {pos}")
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _advance_convoy(self, packer_id: int):
+        """
+        Конвойное продвижение: каждый агент сдвигается ровно на ОДИН слот вперёд,
+        строго по условиям:
+          1. Целевой слот (N-1) физически свободен — ни один агент не стоит там.
+          2. Текущий агент физически стоит в своём слоте (статус WAITING_SLOT).
+
+        Обрабатываем слоты от меньшего к большему:
+          сначала продвигаем слот 2→1, потом 3→2 (только если 2 уже пуст), и т.д.
+        Это гарантирует порядок вереницы без «обгона».
+        """
+        slots   = self.slot_manager.slots.get(packer_id, {})
+        owners  = self.slot_manager.slot_owners.get(packer_id, {})
+        sub_map = self.slot_manager.slot_suborder.get(packer_id, {})
+        sorted_slots = sorted(slots.keys())
+
+        for i, sn in enumerate(sorted_slots):
+            if i == 0:
+                continue  # слот 1 сам не может никуда сдвинуться
+
+            prev_sn  = sorted_slots[i - 1]
+            prev_pos = slots[prev_sn]
+            cur_pos  = slots[sn]
+
+            # Условие 1: предыдущий слот должен быть свободен в slot_owners
+            if owners.get(prev_sn) is not None:
+                continue  # слот N-1 ещё занят
+
+            # Условие 1b: позиция N-1 должна быть физически пуста
+            if any(ag.pos == prev_pos for ag in self.agents.values()):
+                continue  # агент ещё физически стоит там
+
+            # Условие 2: агент в слоте N физически стоит там и ждёт
+            cur_owner = owners.get(sn)
+            if cur_owner is None:
+                continue  # слот N пуст — никого двигать
+
+            ag = self.agents.get(cur_owner)
+            if ag is None or ag.status != STATUS_WAITING_SLOT:
+                continue  # агент ещё не добрался до своего слота — ждём
+
+            # Физически ли агент стоит в cur_pos?
+            if ag.pos != cur_pos:
+                continue  # ещё в пути — ждём
+
+            # Всё готово: двигаем агента из слота sn → prev_sn
+            owners[prev_sn]  = cur_owner
+            sub_map[prev_sn] = sub_map.get(sn)
+            owners[sn]       = None
+            sub_map[sn]      = None
+
+            ag.assigned_slot_num = prev_sn
+            ag.goal              = prev_pos
+            ag.status            = STATUS_CARRY_TO_PACKER
+            ag.urgency           = max(1, min(10, 11 - prev_sn))
+            ag.path              = []
+            logging.info(f"  🔄 Агент {ag.id}: слот {sn}→{prev_sn} @ {prev_pos} "
+                         f"(конвой, фасовщик {packer_id})")
+
+    def _abort_go_to_shelf(self, ag: 'Agent'):
+        """
+        Аварийный сброс GO_TO_SHELF агента → IDLE.
+        Освобождает стеллаж (TAKEN→ACTIVE, возвращает в pending_shelves) и слот.
+        """
+        pid = ag.current_suborder.packer_id if ag.current_suborder else None
+
+        if ag.original_shelf_pos:
+            self.shelf_states[ag.original_shelf_pos] = 'ACTIVE'
+            self._shelf_cooldown[ag.original_shelf_pos] = (
+                self.current_tick + self._SHELF_COOLDOWN_TICKS)
+            if ag.current_suborder and hasattr(ag.current_suborder, 'pending_shelves'):
+                ag.current_suborder.pending_shelves.add(ag.original_shelf_pos)
+                if ag.current_suborder.active_agents > 0:
+                    ag.current_suborder.active_agents -= 1
+
+        if pid and ag.assigned_slot_num:
+            self.slot_manager.release_slot(pid, ag.assigned_slot_num)
+
+        ag.status             = STATUS_IDLE
+        ag.goal               = None
+        ag.current_suborder   = None
+        ag.has_cargo          = False
+        ag.original_shelf_pos = None
+        ag.assigned_slot_num  = None
+        ag.shortest_path_len  = 0
+        ag.path               = []
+        ag.waiting_time       = 0
+
+    def _assign_agent_to_shelf(self, ag: 'Agent', pid: int, sub, shelf_pos, pre_slot):
+        """Вспомогательный: устанавливает агенту задачу GO_TO_SHELF."""
+        self.shelf_states[shelf_pos] = 'TAKEN'
+        ag.status             = STATUS_GO_TO_SHELF
+        ag.goal               = shelf_pos
+        ag.original_shelf_pos = shelf_pos
+        ag.current_suborder   = sub
+        ag.has_cargo          = False
+        ag.unload_timer       = 0
+        ag.assigned_slot_num  = pre_slot[0]
+        ag.shortest_path_len  = 0
+        ag.waiting_time       = 0
+        ag.urgency            = max(1, min(10, 11 - pre_slot[0]))
+        logging.info(f"  🚀 Агент {ag.id} → подзаказ #{sub.suborder_id} "
+                     f"стеллаж {shelf_pos} [слот {pre_slot[0]}]")
+
+    def _find_packer_for_agent(self, ag: 'Agent') -> Optional[int]:
+        if not self.dispatcher:
+            return None
+        for pid in self.slot_manager.slots:
+            free = self.slot_manager.free_slots_count(pid)
+            if free > 0 and self.dispatcher.get_assignable_suborders(
+                    pid, free) is not None:
+                return pid
+            if self.slot_manager.last_slot_free(pid):
+                if self.dispatcher.get_next_pending_suborder(pid) is not None:
+                    return pid
+        return None
+
+    def _pick_free_shelf(self, sub) -> Optional[Tuple[int, int]]:
+        for sp in sorted(sub.pending_shelves):
+            if self.shelf_states.get(sp) != 'ACTIVE':
+                continue
+            # Не назначаем стеллаж пока не истёк cooldown после возврата.
+            # Это даёт время визуализатору показать оранжевый цвет.
+            if self.current_tick < self._shelf_cooldown.get(sp, 0):
+                continue
+            return sp
+        return None
+
+    # ── основной тик ─────────────────────────────────────────────────────────
+    def run_tick(self) -> Dict[str, Any]:
+        self.current_tick += 1
+
+        # Заполняем reservations перед планированием.
+        # Статичные агенты (IDLE/UNLOADING/WAITING_SLOT или без цели) —
+        # t_start=t_end=0 → _is_blocked интерпретирует как постоянную блокировку
+        # на всех временны́х шагах. Движущиеся агенты резервируются только на t=0
+        # (их пути добавятся через _reserve после solve).
+        reservations = self.reservations
+        reservations.clear()
+        _static_statuses = (STATUS_IDLE, STATUS_UNLOADING, STATUS_WAITING_SLOT)
+        for _ag in self.agents.values():
+            reservations.setdefault(_ag.pos, []).append(
+                {'agent_id': _ag.id, 't_start': 0, 't_end': 0})
+
+        # Эксклюзивные резервации слотов: каждый занятый слот — постоянный блок
+        # для всех КРОМЕ владельца. Роутер не прокладывает чужие пути через них.
+        # Это гарантирует физическую эксклюзивность слота.
+        for slot_res_pos, slot_res_entry in self.slot_manager.get_exclusive_reservations().items():
+            existing = reservations.get(slot_res_pos, [])
+            # Если позиция уже в reservations (агент стоит там) — добавляем поверх
+            for entry in slot_res_entry:
+                if not any(e['agent_id'] == entry['agent_id'] for e in existing):
+                    existing.append(entry)
+            reservations[slot_res_pos] = existing
+
+        # ── 0. Восстановление осиротевших стеллажей ─────────────────────────
+        # Стеллаж 'TAKEN'/'RETURNING' должен иметь живого агента.
+        # Если агент завершил цикл или переназначен — стеллаж зависает серым.
+        occupied_shelves: set = set()
+        for ag in self.agents.values():
+            if ag.original_shelf_pos:
+                occupied_shelves.add(ag.original_shelf_pos)
+        for pos, state in list(self.shelf_states.items()):
+            if state in ('TAKEN', 'RETURNING') and pos not in occupied_shelves:
+                self.shelf_states[pos] = 'ACTIVE'
+                logging.debug(f"  🔄 Стеллаж {pos}: {state}→ACTIVE (агент пропал)")
+
+        # ── 0b. Время ожидания ───────────────────────────────────────────────
+        for ag in self.agents.values():
+            if ag.status in (STATUS_WAITING_SLOT, STATUS_IDLE):
+                ag.waiting_time = min(1000, ag.waiting_time + 1)
+            else:
+                ag.waiting_time = 0
+
+        # ── 1. Конвойное продвижение ─────────────────────────────────────────
+        # Каждый агент сдвигается на один слот только когда предыдущая позиция
+        # физически пуста и он сам физически в своём слоте (WAITING_SLOT).
+        for pid in self.slot_manager.slots:
+            self._advance_convoy(pid)
+
+        # ── 2. Назначение задач ──────────────────────────────────────────────
+        #
+        # Два режима назначения:
+        #   ТЕКУЩИЙ подзаказ: acquire_slot (любой свободный слот, кроме last)
+        #     → агент встаёт в хвост очереди текущего подзаказа
+        #   СЛЕДУЮЩИЙ подзаказ: acquire_last_slot (ТОЛЬКО последний слот)
+        #     → обеспечивает непрерывный поток к фасовщику
+        #     → номер в подзаказе = 1, но физически — в последней позиции очереди
+        #
+        if self.dispatcher:
+            from dispatcher import SubOrderStatus as _SOS
+            free_agents = sorted(
+                [a for a in self.agents.values()
+                 if a.status == STATUS_IDLE and not a.path],
+                key=lambda a: -a.waiting_time)
+
+            for ag in free_agents:
+                assigned = False
+
+                for pid in list(self.slot_manager.slots.keys()):
+                    if assigned: break
+
+                    # ── 2a. Попытка войти в ТЕКУЩИЙ подзаказ ──────────────
+                    free_slots = self.slot_manager.free_slots_count(pid)
+                    if free_slots > 0:
+                        cur_sub = self.dispatcher.get_assignable_suborders(pid, free_slots)
+                        if cur_sub is not None:
+                            target_shelf = self._pick_free_shelf(cur_sub)
+                            if target_shelf is not None:
+                                pre_slot = self.slot_manager.acquire_slot(
+                                    pid, ag.id, suborder_id=cur_sub.suborder_id)
+                                if pre_slot is not None:
+                                    if self.dispatcher.take_shelf_from_suborder(
+                                            cur_sub.suborder_id, target_shelf, ag.id):
+                                        self._assign_agent_to_shelf(
+                                            ag, pid, cur_sub, target_shelf, pre_slot)
+                                        assigned = True
+                                        break
+                                    else:
+                                        self.slot_manager.release_slot(pid, pre_slot[0])
+
+                    # ── 2b. Попытка войти в СЛЕДУЮЩИЙ подзаказ (только last slot) ──
+                    if not assigned and self.slot_manager.last_slot_free(pid):
+                        next_sub = self.dispatcher.get_next_pending_suborder(pid)
+                        if next_sub is not None:
+                            target_shelf = self._pick_free_shelf(next_sub)
+                            if target_shelf is not None:
+                                pre_slot = self.slot_manager.acquire_last_slot(
+                                    pid, ag.id, suborder_id=next_sub.suborder_id)
+                                if pre_slot is not None:
+                                    if self.dispatcher.take_shelf_from_suborder(
+                                            next_sub.suborder_id, target_shelf, ag.id):
+                                        self._assign_agent_to_shelf(
+                                            ag, pid, next_sub, target_shelf, pre_slot)
+                                        assigned = True
+                                    else:
+                                        self.slot_manager.release_slot(pid, pre_slot[0])
+
+        # ── 3. Переходы состояний ────────────────────────────────────────────
+        for ag in self.agents.values():
+
+            if ag.status == STATUS_UNLOADING:
+                ag.unload_timer -= 1
+                if ag.unload_timer <= 0:
+                    pid = ag.current_suborder.packer_id if ag.current_suborder else None
+                    if pid and ag.assigned_slot_num:
+                        self.slot_manager.release_slot(pid, ag.assigned_slot_num)
+                        # НЕ вызываем reorder_queue/_sync_slot_goals:
+                        # _advance_convoy на следующем тике сам продвинет
+                        # следующего агента только после физического освобождения позиции.
+                        # Это обеспечивает строгий конвойный порядок.
+                    ag.status            = STATUS_RETURN_SHELF
+                    ag.goal              = ag.original_shelf_pos
+                    ag.has_cargo         = True
+                    ag.assigned_slot_num = None
+                    ag.shortest_path_len = 0
+                    ag.path              = []
+                    if ag.original_shelf_pos:
+                        self.shelf_states[ag.original_shelf_pos] = 'RETURNING'
+                continue
+
+            if ag.status == STATUS_GO_TO_SHELF and ag.goal and ag.pos == ag.goal:
+                pid = ag.current_suborder.packer_id if ag.current_suborder else None
+                if pid is None:
+                    ag.path = []; continue
+
+                # Слот pre-assigned при назначении задачи.
+                # Проверяем что слот всё ещё за этим агентом после возможных reorder_queue.
+                current_sn = self.slot_manager.get_agent_slot(pid, ag.id)
+                if current_sn is None:
+                    # Слот потерян (reorder убрал агента из очереди).
+                    # Пробуем взять заново.
+                    _sub_id = ag.current_suborder.suborder_id if ag.current_suborder else None
+                    slot_res = self.slot_manager.acquire_slot(pid, ag.id, suborder_id=_sub_id)
+                    if slot_res is None:
+                        # Все слоты заняты — аварийный сброс.
+                        # Продолжение ожидания = вечная заморозка: стеллаж TAKEN,
+                        # агент в GO_TO_SHELF без пути, подзаказ не продвигается.
+                        logging.warning(
+                            f"  ⚠️ Агент {ag.id}: прибыл на стеллаж "
+                            f"{ag.original_shelf_pos} но нет слота → сброс в IDLE")
+                        self._abort_go_to_shelf(ag)
+                        continue
+                    current_sn = slot_res[0]
+
+                ag.assigned_slot_num = current_sn  # синхронизируем с реальным слотом
+                slot_pos = self.slot_manager.slots.get(pid, {}).get(current_sn)
+                if slot_pos is None:
+                    ag.path = []; continue
+                ag.goal              = slot_pos
+                ag.urgency           = max(1, min(10, 11 - current_sn))
+                ag.status            = STATUS_CARRY_TO_PACKER
+                ag.has_cargo         = True
+                ag.shortest_path_len = 0
+                ag.path              = []
+                logging.info(f"  📦 Агент {ag.id} несёт товар → слот {current_sn} @ {ag.goal}")
+
+            elif ag.status == STATUS_CARRY_TO_PACKER and ag.goal and ag.pos == ag.goal:
+                if ag.assigned_slot_num == 1:
+                    ag.status       = STATUS_UNLOADING
+                    ag.unload_timer = 5
+                    pid_log = ag.current_suborder.packer_id if ag.current_suborder else '?'
+                    logging.info(f"  📦 Агент {ag.id} разгружается "
+                                 f"(слот 1, фасовщик {pid_log})")
+                else:
+                    # Агент достиг своего слота в очереди — ждёт продвижения
+                    ag.status = STATUS_WAITING_SLOT
+                    logging.info(f"  ⏳ Агент {ag.id} ждёт в слоте "
+                                 f"{ag.assigned_slot_num} @ {ag.pos}")
+                ag.path = []
+
+            elif ag.status == STATUS_RETURN_SHELF and ag.goal and ag.pos == ag.goal:
+                if ag.original_shelf_pos:
+                    self.shelf_states[ag.original_shelf_pos] = 'ACTIVE'
+                    # Защита от немедленного переназначения: стеллаж будет
+                    # оранжевым минимум _SHELF_COOLDOWN_TICKS тиков.
+                    self._shelf_cooldown[ag.original_shelf_pos] = (
+                        self.current_tick + self._SHELF_COOLDOWN_TICKS)
+                if self.dispatcher and ag.current_suborder:
+                    self.dispatcher.complete_agent_in_suborder(
+                        ag.current_suborder.suborder_id)
+                ag.status             = STATUS_IDLE
+                ag.goal               = None
+                ag.current_suborder   = None
+                ag.has_cargo          = False
+                ag.unload_timer       = 0
+                ag.original_shelf_pos = None
+                ag.assigned_slot_num  = None
+                ag.shortest_path_len  = 0
+                ag.path               = []
+
+        # ── 4. DeadlockResolver ──────────────────────────────────────────────
+        # update_last_move вызывается ПОСЛЕ движения (в конце тика — шаг 6),
+        # но check_and_resolve нужен ДО планирования — поэтому вызываем здесь
+        # с данными прошлого тика (позиции уже актуальны после move).
+        actions = self.deadlock_resolver.check_and_resolve(
+            self.agents, reservations, self.current_tick)
+
+        # ── 5. Формирование задач для роутера ────────────────────────────────
+        tasks = []
+        for ag in self.agents.values():
+            if ag.goal is None: continue
+            if ag.status in (STATUS_UNLOADING, STATUS_IDLE, STATUS_WAITING_SLOT):
+                continue
+
+            # GO_TO_SHELF + REPLAN = агент застрял (путь к стеллажу недостижим).
+            # Abort: возвращаем стеллаж в pending_shelves, слот → свободен, агент → IDLE.
+            if ag.status == STATUS_GO_TO_SHELF and actions.get(ag.id) == 'REPLAN':
+                logging.warning(f"  ⚠️ Агент {ag.id}: GO_TO_SHELF застрял → abort")
+                self._abort_go_to_shelf(ag)
+                continue
+
+            returning_shelf = (ag.status == STATUS_RETURN_SHELF)
+            if ag.shortest_path_len == 0 and hasattr(self.router, 'path_length'):
+                ag.shortest_path_len = self.router.path_length(
+                    ag.pos, ag.goal, ag.has_cargo, returning_shelf)
+
+            ag.compute_score()
+            tasks.append({
+                'agent_id':        ag.id,
+                'start':           ag.pos,
+                'goal':            ag.goal,
+                'score':           ag.score,
+                'has_cargo':       ag.has_cargo,
+                'returning_shelf': returning_shelf,
+                'action':          actions.get(ag.id, 'OK'),
+            })
+
+        # ── 6. Планирование и движение ───────────────────────────────────────
+        paths = self.router.solve(tasks, reservations)
+
+        # 6_L2. WFG-обнаружение циклов + локальный CBS (Уровень 2).
+        # Запускается ПОСЛЕ router.solve() и ДО записи путей в агентов.
+        # Перепланирует только агентов, попавших в циклический дедлок,
+        # оставляя пути остальных нетронутыми.
+        paths = self.deadlock_resolver.resolve_local_deadlocks(
+            self.agents, paths, tasks, self.current_tick,
+            reservations=reservations)
+
+        # 6a. Записываем пути (ещё не двигаемся)
+        for aid, path in paths.items():
+            ag = self.agents[aid]
+            actual_len = len(path) - 1 if len(path) > 1 else 0
+            ag.compute_score(actual_path_len=actual_len)
+            if actual_len > 0 and actual_len != ag.shortest_path_len:
+                ag.shortest_path_len = 0
+            ag.path               = path
+            ag.current_path_index = 1  # path[0]=cur pos, path[1]=next step
+
+        # 6b. Финальный enforcement: vertex + swap + IDLE-уступка.
+        # Возвращает (allowed_to_move, idle_displacements):
+        #   allowed_to_move   — агенты с путями, которым разрешён шаг
+        #   idle_displacements — {idle_id: new_pos} физические смещения IDLE
+        allowed_to_move, idle_displacements = self.deadlock_resolver.resolve_movement_conflicts(
+            self.agents, paths)
+
+        # 6c. move() только для разрешённых активных агентов (есть путь от роутера)
+        for aid, path in paths.items():
+            ag = self.agents[aid]
+            if aid in allowed_to_move and len(path) >= 2:
+                ag.move()
+            else:
+                ag.current_path_index = 0  # перепланировать в следующем тике
+
+        # 6d. Физические смещения IDLE-агентов (уступили дорогу активному агенту).
+        # IDLE не имеют путей от роутера → ag.move() их не затрагивает.
+        # Применяем позиции напрямую — controlled swap уже гарантирует отсутствие
+        # коллизий (IDLE уходит на клетку, которую активный агент покидает).
+        for idle_id, new_pos in idle_displacements.items():
+            self.agents[idle_id].pos = new_pos
+
+        # DeadlockResolver запоминает позиции ПОСЛЕ движения
+        self.deadlock_resolver.update_last_move(self.agents, self.current_tick)
+
+        # ── 7. Сборка state ───────────────────────────────────────────────────
+        return {
+            'agents': {
+                ag.id: {
+                    'pos':          ag.pos,
+                    'status':       ag.status,
+                    'score':        ag.score,
+                    'id':           ag.id,
+                    'has_cargo':    ag.has_cargo,
+                    'unload_timer': ag.unload_timer,
+                    'path':         ag.path,
+                }
+                for ag in self.agents.values()
+            },
+            'reservations': reservations,
+            'shelf_states': self.shelf_states,
+        }
+
+
+# Обратная совместимость
+from router_interface import PrioritizedAStarSolver as AStarRouter

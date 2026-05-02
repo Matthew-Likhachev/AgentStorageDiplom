@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple, Optional
 from simulation.Agent import create_agent_at_first_charger, STATUSES_WEIGHTS, BATTERY_MAX, BATTERY_LOW_THRESHOLD
 
 # ================= КОНФИГУРАЦИЯ =================
-DEFAULT_MAP_FILE = "A:\projects in programming\python\AgentStorage\AgentStorageDiplom\excelloader\map_data_fixed.json"
+DEFAULT_MAP_FILE = "./map_data_fixed.json"
 DEFAULT_CELL_SIZE = 30
 BG_COLOR = (255, 255, 255)
 FLOOR_COLOR = (210, 210, 210)

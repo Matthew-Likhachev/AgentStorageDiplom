@@ -12,6 +12,18 @@ def f_shelf1(blank,start_id,rows,columns_left,step_left):
         result.append(line)
     return result
 
+#полки 2 в ряду
+def f_shelf2(blank_l, blank_r,start_id,rows,columns_left,step_left):
+    arr_blank_l = blank_l.split('XXX')
+    arr_blank_r = blank_r.split('XXX')
+
+    result = []
+    for row in range(rows):
+        line = [arr_blank_l[0]+str(start_id+i)+arr_blank_l[1]+';'+arr_blank_r[0]+str(start_id+i+rows)+arr_blank_r[1]+(';' * (step_left + 1)) for i in range (row,columns_left*rows*2,2*rows)]
+        line[-1]= line[-1][0:(len(line[-1])-(step_left + 1))] #удаление последних символов ; в последнем элементе
+        result.append(line)
+    return result
+
 #места фасовщика от одного по возрастанию
 def f_Zone_asc(blank, start_id, end_id):
     arr_blank = blank.split('XXX')
@@ -36,7 +48,7 @@ def f_Zone_desc(blank, start_id, end_id):
 
 #полки/стеллажи 1 слой в ряду, расстояние между рядами step_left, количество рядов columns_left
 blank = 'S|-w--e|n-w-s-e|{"shelf_id":XXX}'
-start_id = 0  #номер начальной клетки
+start_id = 99  #номер начальной клетки
 rows = 9    #количество полок в одном ряду
 columns_left = 11    #количество рядов полок слева направо
 step_left = 1   #шаг между колоннами
@@ -64,15 +76,16 @@ end_id = 20 #номер конечной клетки
 blank = 'B|n-w-s-e|n-w-s-e|{"packer_id":2,"zone":"buffer","slot":XXX}'
 start_id = 11  #номер начальной клетки
 end_id = 20 #номер конечной клетки
-print_res(f_Zone_desc(blank, start_id, end_id))
+# print_res(f_Zone_desc(blank, start_id, end_id))
 
 #полки/стеллажи 1 слой в ряду, расстояние между рядами step_left, количество рядов columns_left
-blank = 'C|---|n-w-s-e|{"charger_id":XXX}'
-start_id = 1  #номер начальной клетки
-rows = 10    #количество полок в одном ряду
-columns_left = 1    #количество рядов полок слева направо
-step_left = 0   #шаг между колоннами
-# print_res(f_shelf1(blank,start_id,rows,columns_left,step_left))
+blank_l = 'S|-w--|n-w-s-e|{"shelf_id":XXX}' #стеллаж слева. Выезд разрешен налево
+blank_r = 'S|---e|n-w-s-e|{"shelf_id":XXX}' #стеллаж справа. Выезд разрешен направо
+start_id = 126  #номер начальной клетки
+rows = 9    #количество полок в одном ряду
+columns_left = 7    #количество рядов полок слева направо
+step_left = 1   #шаг между колоннами
+print_res(f_shelf2(blank_l, blank_r,start_id,rows,columns_left,step_left))
 
 
 # Свободное пространство (белые клетки)
