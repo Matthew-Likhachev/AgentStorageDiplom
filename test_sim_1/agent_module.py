@@ -248,6 +248,13 @@ class AgentManager:
         # пока current_tick < cooldown_until, чтобы оранжевый был виден ≥N тиков.
         self._shelf_cooldown: Dict[Tuple[int, int], int] = {}
         self._SHELF_COOLDOWN_TICKS = 3   # минимум тиков оранжевого
+        # Счётчик аборт-попыток для каждого стеллажа.
+        # Если один стеллаж абортируется слишком много раз подряд —
+        # он физически недостижим (заблокирован). Такой стеллаж
+        # помечается как STUCK и исключается из подзаказа навсегда,
+        # чтобы не зациклить систему в бесконечных retry.
+        self._shelf_abort_count: Dict[Tuple[int, int], int] = {}
+        self._SHELF_MAX_ABORTS  = 5  # попыток перед признанием недостижимым
         for row in map_data.get('cells', []):
             for c in row:
                 if c['type'] == 'S':
@@ -362,8 +369,97 @@ class AgentManager:
             ag.status            = STATUS_CARRY_TO_PACKER
             ag.urgency           = max(1, min(10, 11 - prev_sn))
             ag.path              = []
+
             logging.info(f"  🔄 Агент {ag.id}: слот {sn}→{prev_sn} @ {prev_pos} "
                          f"(конвой, фасовщик {packer_id})")
+
+    def _try_hijack_blocker(self, stuck_ag: 'Agent') -> bool:
+        """
+        Вызывается когда stuck_ag завис в GO_TO_SHELF и не может добраться до полки.
+
+        Проверяем: стоит ли другой агент прямо на целевой полке?
+        Агент без груза может находиться на стеллаже — именно он блокирует путь.
+
+        Стратегия:
+          1. Найти агента blocker на позиции целевой полки.
+          2. Если blocker IDLE (без задачи) — назначить ЕГО перевозчиком этой полки.
+             stuck_ag при этом освобождает полку и уходит в IDLE.
+          3. Если blocker занят (GO_TO_SHELF, CARRY...) — не трогаем, делаем обычный abort.
+
+        Возвращает True если проблема решена (abort не нужен).
+        """
+        shelf_pos = stuck_ag.original_shelf_pos
+        if shelf_pos is None:
+            return False
+        if stuck_ag.current_suborder is None:
+            return False
+
+        # Ищем агента, стоящего на целевой полке
+        blocker = None
+        for other in self.agents.values():
+            if other.id != stuck_ag.id and other.pos == shelf_pos:
+                blocker = other
+                break
+
+        if blocker is None:
+            return False  # Полка свободна — другая причина застревания
+
+        sub = stuck_ag.current_suborder
+        pid = sub.packer_id
+
+        # Блокирующий агент должен быть без груза и без активной задачи
+        if blocker.has_cargo:
+            logging.info(
+                f"  🔄 Агент {stuck_ag.id}: блокер А{blocker.id} несёт груз — abort штатный")
+            return False
+        if blocker.status not in (STATUS_IDLE, STATUS_WAITING_SLOT):
+            logging.info(
+                f"  🔄 Агент {stuck_ag.id}: блокер А{blocker.id} "
+                f"занят ({blocker.status}) — abort штатный")
+            return False
+
+        # Blocker стоит на полке и свободен → назначаем его перевозчиком
+        # Шаг 1: stuck_ag освобождает полку (без возврата в pending — blocker возьмёт её)
+        if pid and stuck_ag.assigned_slot_num:
+            self.slot_manager.release_slot(pid, stuck_ag.assigned_slot_num)
+
+        # Шаг 2: переносим слот и задачу на blocker
+        # Blocker освобождает свой старый слот если был в очереди
+        if blocker.assigned_slot_num is not None:
+            blocker_pid = (blocker.current_suborder.packer_id
+                           if blocker.current_suborder else pid)
+            self.slot_manager.release_slot(blocker_pid, blocker.assigned_slot_num)
+
+        # Захватываем слот для blocker
+        pre_slot = self.slot_manager.acquire_slot(
+            pid, blocker.id, suborder_id=sub.suborder_id)
+        if pre_slot is None:
+            # Нет свободных слотов — обычный abort
+            logging.info(
+                f"  🔄 Агент {stuck_ag.id}: блокер А{blocker.id} есть, "
+                f"но нет слота → abort штатный")
+            return False
+
+        # Назначаем blocker перевозчиком
+        self._assign_agent_to_shelf(blocker, pid, sub, shelf_pos, pre_slot)
+        # Полка уже в TAKEN (была назначена stuck_ag), статус не меняем
+
+        # Шаг 3: stuck_ag → IDLE, задача снята
+        stuck_ag.status             = STATUS_IDLE
+        stuck_ag.goal               = None
+        stuck_ag.original_shelf_pos = None
+        stuck_ag.current_suborder   = None
+        stuck_ag.has_cargo          = False
+        stuck_ag.assigned_slot_num  = None
+        stuck_ag.path               = []
+        stuck_ag.waiting_time       = 0
+        # Счётчик абортов для этой полки — не увеличиваем: это не настоящий abort
+        self._shelf_abort_count.pop(shelf_pos, None)
+
+        logging.info(
+            f"  🔀 Hijack: А{stuck_ag.id} застрял у полки {shelf_pos} "
+            f"→ передал задачу А{blocker.id} (стоит на полке)")
+        return True
 
     def _abort_go_to_shelf(self, ag: 'Agent'):
         """
@@ -373,13 +469,69 @@ class AgentManager:
         pid = ag.current_suborder.packer_id if ag.current_suborder else None
 
         if ag.original_shelf_pos:
-            self.shelf_states[ag.original_shelf_pos] = 'ACTIVE'
-            self._shelf_cooldown[ag.original_shelf_pos] = (
+            shelf_pos = ag.original_shelf_pos
+
+            # ── Счётчик аборт-попыток ──────────────────────────────────────
+            self._shelf_abort_count[shelf_pos] = (
+                self._shelf_abort_count.get(shelf_pos, 0) + 1)
+            abort_cnt = self._shelf_abort_count[shelf_pos]
+
+            self.shelf_states[shelf_pos] = 'ACTIVE'
+            self._shelf_cooldown[shelf_pos] = (
                 self.current_tick + self._SHELF_COOLDOWN_TICKS)
+
             if ag.current_suborder and hasattr(ag.current_suborder, 'pending_shelves'):
-                ag.current_suborder.pending_shelves.add(ag.original_shelf_pos)
-                if ag.current_suborder.active_agents > 0:
-                    ag.current_suborder.active_agents -= 1
+
+                if abort_cnt >= self._SHELF_MAX_ABORTS:
+                    # Стеллаж физически недостижим — исключаем из подзаказа.
+                    # НЕ возвращаем в pending_shelves — иначе бесконечный retry.
+                    ag.current_suborder.pending_shelves.discard(shelf_pos)
+                    if ag.current_suborder.active_agents > 0:
+                        ag.current_suborder.active_agents -= 1
+                    # Помечаем как STUCK (не берётся никем)
+                    self.shelf_states[shelf_pos] = 'STUCK'
+                    logging.warning(
+                        f"  🚫 Стеллаж {shelf_pos} недостижим "
+                        f"({abort_cnt} аборт-попыток) — исключён из подзаказа "
+                        f"#{ag.current_suborder.suborder_id}")
+                    # Если pending_shelves опустел — подзаказ теперь в COMPLETING
+                    try:
+                        from dispatcher import SubOrderStatus as _SOS
+                        sub = ag.current_suborder
+                        if (not sub.pending_shelves
+                                and sub.status == _SOS.IN_PROGRESS):
+                            sub.status = _SOS.COMPLETING
+                            logging.info(
+                                f"  🔄 Подзаказ #{sub.suborder_id}: "
+                                f"→ COMPLETING (последний стеллаж недостижим)")
+                    except ImportError:
+                        pass
+                else:
+                    # Обычный abort — возвращаем в очередь
+                    ag.current_suborder.pending_shelves.add(shelf_pos)
+                    if ag.current_suborder.active_agents > 0:
+                        ag.current_suborder.active_agents -= 1
+                    # Агент прерван до разгрузки — delivered_agents не трогаем
+                    try:
+                        from dispatcher import SubOrderStatus as _SOS
+                        if ag.current_suborder.status == _SOS.COMPLETING:
+                            ag.current_suborder.status = _SOS.IN_PROGRESS
+                            if self.dispatcher:
+                                pid_sub = ag.current_suborder.packer_id
+                                cur_active = self.dispatcher.active_suborder_id.get(pid_sub)
+                                if cur_active != ag.current_suborder.suborder_id:
+                                    self.dispatcher.active_suborder_id[pid_sub] = (
+                                        ag.current_suborder.suborder_id)
+                                    logging.info(
+                                        f"  ↩️ Подзаказ #{ag.current_suborder.suborder_id}: "
+                                        f"COMPLETING→IN_PROGRESS, active_suborder_id восстановлен")
+                        elif ag.current_suborder.status == _SOS.IN_PROGRESS:
+                            logging.info(
+                                f"  ↩️ Подзаказ #{ag.current_suborder.suborder_id}: "
+                                f"стеллаж {shelf_pos} возвращён "
+                                f"(попытка {abort_cnt}/{self._SHELF_MAX_ABORTS})")
+                    except ImportError:
+                        pass
 
         if pid and ag.assigned_slot_num:
             self.slot_manager.release_slot(pid, ag.assigned_slot_num)
@@ -393,6 +545,87 @@ class AgentManager:
         ag.shortest_path_len  = 0
         ag.path               = []
         ag.waiting_time       = 0
+
+    def print_order_summary(self):
+        """
+        Выводит в консоль текущее состояние заказов и назначений.
+        Формат: Заказ → Подзаказы → Агенты.
+        Дополнительно: разбивка IDLE/ожидающих агентов для диагностики freeze.
+        """
+        if not self.dispatcher:
+            return
+        print("\n" + "═"*60)
+        print(f"  📋 ЗАКАЗЫ — тик {self.current_tick}")
+        print("═"*60)
+
+        # Карта: suborder_id → список агентов
+        sub_agents: Dict[int, List[int]] = {}
+        for ag in self.agents.values():
+            if ag.current_suborder is not None:
+                sid = ag.current_suborder.suborder_id
+                sub_agents.setdefault(sid, []).append(ag.id)
+
+        # Карта: статус → список агентов (для диагностики)
+        status_groups: Dict[str, List[int]] = {}
+        for ag in self.agents.values():
+            status_groups.setdefault(ag.status, []).append(ag.id)
+
+        for pid in self.dispatcher.packer_ids:
+            act_oid = self.dispatcher.active_order_id.get(pid)
+            act_sid = self.dispatcher.active_suborder_id.get(pid)
+            print(f"\n  Фасовщик {pid}:")
+
+            if act_oid is None:
+                print("    — нет активного заказа")
+                continue
+
+            order = self.dispatcher.orders.get(act_oid)
+            if order is None:
+                continue
+
+            print(f"    Заказ #{act_oid}  ({len(order.suborders)} подзаказов)")
+
+            for sub in order.suborders:
+                sid   = sub.suborder_id
+                st    = sub.status.value
+                agents = sub_agents.get(sid, [])
+                is_act = "◀ АКТИВНЫЙ" if sid == act_sid else ""
+                pending_n = len(sub.pending_shelves)
+                total_n   = len(sub.required_shelves)
+
+                agents_str = (", ".join(f"А{a}" for a in sorted(agents))
+                              if agents else "—")
+
+                # Показываем стеллажи с аборт-предупреждениями
+                stuck_shelves = [
+                    f"{pos}×{cnt}"
+                    for pos, cnt in self._shelf_abort_count.items()
+                    if pos in sub.pending_shelves and cnt > 0]
+                stuck_str = f"  ⚠️abort:{','.join(stuck_shelves)}" if stuck_shelves else ""
+
+                print(f"      Подзаказ #{sid:3d}  [{st:13s}]  "
+                      f"{total_n}п({pending_n}ждут/{sub.active_agents}в пути)  "
+                      f"агенты: {agents_str}  {is_act}{stuck_str}")
+
+        # ── Диагностика: статусы всех агентов ────────────────────────────
+        idle_ids = sorted(status_groups.get(STATUS_IDLE, []))
+        wait_ids = sorted(status_groups.get(STATUS_WAITING_SLOT, []))
+        go_ids   = sorted(status_groups.get(STATUS_GO_TO_SHELF, []))
+        carry_ids= sorted(status_groups.get(STATUS_CARRY_TO_PACKER, []))
+        ret_ids  = sorted(status_groups.get(STATUS_RETURN_SHELF, []))
+        unl_ids  = sorted(status_groups.get(STATUS_UNLOADING, []))
+
+        parts = []
+        if idle_ids:  parts.append(f"IDLE:{','.join(f'А{i}' for i in idle_ids)}")
+        if go_ids:    parts.append(f"GO:{','.join(f'А{i}' for i in go_ids)}")
+        if carry_ids: parts.append(f"CARRY:{','.join(f'А{i}' for i in carry_ids)}")
+        if unl_ids:   parts.append(f"UNLOAD:{','.join(f'А{i}' for i in unl_ids)}")
+        if wait_ids:  parts.append(f"WAIT_SLOT:{','.join(f'А{i}' for i in wait_ids)}")
+        if ret_ids:   parts.append(f"RETURN:{','.join(f'А{i}' for i in ret_ids)}")
+        if parts:
+            print(f"\n  🤖 Агенты: {' | '.join(parts)}")
+
+        print("═"*60 + "\n")
 
     def _assign_agent_to_shelf(self, ag: 'Agent', pid: int, sub, shelf_pos, pre_slot):
         """Вспомогательный: устанавливает агенту задачу GO_TO_SHELF."""
@@ -480,7 +713,45 @@ class AgentManager:
             else:
                 ag.waiting_time = 0
 
-        # ── 1. Конвойное продвижение ─────────────────────────────────────────
+        # ── 0c. Ранняя обработка UNLOADING ───────────────────────────────────
+        # КРИТИЧНО: завершение разгрузки должно происходить ДО шага 2 (назначение),
+        # иначе шаг 2 никогда не увидит освобождённые слоты — они появлялись в шаге 3
+        # (после назначения) и следующий подзаказ запускался только в следующем тике.
+        #
+        # Также отслеживаем "vacating_slots" — позиции слотов которые освобождаются
+        # ПРЯМО СЕЙЧАС: агент уходит в RETURN_SHELF и физически ещё стоит на месте
+        # слота, но бронь снята. Шаг 2 должен игнорировать физическое присутствие
+        # этих агентов при проверке свободности слота.
+        vacating_slot_positions: set = set()
+
+        for ag in self.agents.values():
+            if ag.status != STATUS_UNLOADING:
+                continue
+            ag.unload_timer -= 1
+            if ag.unload_timer > 0:
+                continue
+
+            pid = ag.current_suborder.packer_id if ag.current_suborder else None
+            # Запоминаем позицию слота ДО освобождения
+            if pid and ag.assigned_slot_num:
+                slot_pos_vac = self.slot_manager.slots.get(pid, {}).get(
+                    ag.assigned_slot_num)
+                if slot_pos_vac:
+                    vacating_slot_positions.add(slot_pos_vac)
+                self.slot_manager.release_slot(pid, ag.assigned_slot_num)
+            if self.dispatcher and ag.current_suborder:
+                self.dispatcher.mark_delivery_complete(
+                    ag.current_suborder.suborder_id)
+            ag.status            = STATUS_RETURN_SHELF
+            ag.goal              = ag.original_shelf_pos
+            ag.has_cargo         = True
+            ag.assigned_slot_num = None
+            ag.shortest_path_len = 0
+            ag.path              = []
+            if ag.original_shelf_pos:
+                self.shelf_states[ag.original_shelf_pos] = 'RETURNING'
+
+
         # Каждый агент сдвигается на один слот только когда предыдущая позиция
         # физически пуста и он сам физически в своём слоте (WAITING_SLOT).
         for pid in self.slot_manager.slots:
@@ -505,19 +776,39 @@ class AgentManager:
             for ag in free_agents:
                 assigned = False
 
+                # Позиции всех агентов — строим один раз на итерацию (O(N))
+                _all_positions = {a.pos for a in self.agents.values()} - vacating_slot_positions
+
                 for pid in list(self.slot_manager.slots.keys()):
                     if assigned: break
 
                     # ── 2a. Попытка войти в ТЕКУЩИЙ подзаказ ──────────────
+                    # Используем тот же принцип что и 2b: слот должен быть
+                    # свободен и в slot_owners, и физически. Это важно когда
+                    # mark_delivery_complete переключил active_suborder_id раньше
+                    # чем предыдущие агенты физически покинули свои слоты.
                     free_slots = self.slot_manager.free_slots_count(pid)
                     if free_slots > 0:
                         cur_sub = self.dispatcher.get_assignable_suborders(pid, free_slots)
                         if cur_sub is not None:
                             target_shelf = self._pick_free_shelf(cur_sub)
                             if target_shelf is not None:
-                                pre_slot = self.slot_manager.acquire_slot(
-                                    pid, ag.id, suborder_id=cur_sub.suborder_id)
-                                if pre_slot is not None:
+                                # Ищем слот свободный И по owners, И физически
+                                _owners_2a = self.slot_manager.slot_owners.get(pid, {})
+                                _slots_2a  = self.slot_manager.slots.get(pid, {})
+                                _free_sn_2a = None
+                                for _sn in sorted(_owners_2a.keys(), reverse=True):
+                                    if _owners_2a[_sn] is not None:
+                                        continue
+                                    if _slots_2a.get(_sn) in _all_positions:
+                                        continue  # физически занят
+                                    _free_sn_2a = _sn
+                                    break
+                                if _free_sn_2a is not None:
+                                    _owners_2a[_free_sn_2a] = ag.id
+                                    self.slot_manager.slot_suborder.get(
+                                        pid, {})[_free_sn_2a] = cur_sub.suborder_id
+                                    pre_slot = (_free_sn_2a, _slots_2a[_free_sn_2a])
                                     if self.dispatcher.take_shelf_from_suborder(
                                             cur_sub.suborder_id, target_shelf, ag.id):
                                         self._assign_agent_to_shelf(
@@ -525,49 +816,99 @@ class AgentManager:
                                         assigned = True
                                         break
                                     else:
-                                        self.slot_manager.release_slot(pid, pre_slot[0])
+                                        _owners_2a[_free_sn_2a] = None
+                                        self.slot_manager.slot_suborder.get(
+                                            pid, {})[_free_sn_2a] = None
 
-                    # ── 2b. Попытка войти в СЛЕДУЮЩИЙ подзаказ (только last slot) ──
-                    if not assigned and self.slot_manager.last_slot_free(pid):
-                        next_sub = self.dispatcher.get_next_pending_suborder(pid)
-                        if next_sub is not None:
-                            target_shelf = self._pick_free_shelf(next_sub)
-                            if target_shelf is not None:
-                                pre_slot = self.slot_manager.acquire_last_slot(
-                                    pid, ag.id, suborder_id=next_sub.suborder_id)
-                                if pre_slot is not None:
-                                    if self.dispatcher.take_shelf_from_suborder(
-                                            next_sub.suborder_id, target_shelf, ag.id):
-                                        self._assign_agent_to_shelf(
-                                            ag, pid, next_sub, target_shelf, pre_slot)
-                                        assigned = True
-                                    else:
-                                        self.slot_manager.release_slot(pid, pre_slot[0])
+                    # ── 2b. Конвейер следующего подзаказа ─────────────────
+                    # ТЗ: «когда освобождаются слоты у фасовщика, в них могут
+                    # ехать агенты из следующего подзаказа. При этом слот
+                    # не должен быть занят или забронирован агентами текущего
+                    # подзаказа. При переназначении агента в текущем подзаказе
+                    # сначала сдаётся текущий — следующий не имеет права занимать
+                    # слоты нужные текущему».
+                    #
+                    # Алгоритм:
+                    #   A. Считаем действительно свободные слоты:
+                    #      slot_owners[N] is None  И  позиция физически пуста
+                    #      (конвой обнуляет slot_owners раньше физического хода)
+                    #   B. Считаем сколько из них НУЖНЫ текущему подзаказу:
+                    #      = len(cur_sub.pending_shelves)
+                    #      (каждому pending-стеллажу нужен один свободный слот)
+                    #   C. Доступно следующему = max(0, A - B)
+                    #   D. Берём слот с наибольшим номером (хвост очереди)
+                    #      — агент следующего подзаказа встаёт позади всех текущих
+                    if not assigned:
+                        cur_sid_2b = self.dispatcher.active_suborder_id.get(pid)
+                        if cur_sid_2b is not None:
+                            # Находим текущий активный подзаказ
+                            cur_sub_2b = None
+                            for _ord2 in self.dispatcher.active_queue:
+                                for _s2 in _ord2.suborders:
+                                    if _s2.suborder_id == cur_sid_2b:
+                                        cur_sub_2b = _s2
+                                        break
+                                if cur_sub_2b:
+                                    break
+
+                            if cur_sub_2b is not None:
+                                owners_2b      = self.slot_manager.slot_owners.get(pid, {})
+                                slots_2b       = self.slot_manager.slots.get(pid, {})
+                                agent_pos_set  = {a.pos for a in self.agents.values()} - vacating_slot_positions
+
+                                # A. Все реально свободные слоты (sorted desc = хвост первым)
+                                free_slots_2b = sorted(
+                                    [sn for sn, oid in owners_2b.items()
+                                     if oid is None
+                                     and slots_2b.get(sn) not in agent_pos_set],
+                                    reverse=True)
+
+                                # B. Сколько нужно текущему подзаказу
+                                reserved_for_current = len(cur_sub_2b.pending_shelves)
+
+                                # C. Сколько доступно следующему
+                                available_for_next = len(free_slots_2b) - reserved_for_current
+
+                                if available_for_next > 0:
+                                    next_sub_2b = self.dispatcher.get_next_pending_suborder(pid)
+                                    if next_sub_2b is not None:
+                                        target_2b = self._pick_free_shelf(next_sub_2b)
+                                        if target_2b is not None:
+                                            # D. Берём наибольший свободный слот
+                                            sn_2b      = free_slots_2b[0]
+                                            slot_pos_2b = slots_2b[sn_2b]
+                                            # Бронируем
+                                            owners_2b[sn_2b] = ag.id
+                                            self.slot_manager.slot_suborder.get(
+                                                pid, {})[sn_2b] = next_sub_2b.suborder_id
+                                            pre_slot_2b = (sn_2b, slot_pos_2b)
+                                            if self.dispatcher.take_shelf_from_suborder(
+                                                    next_sub_2b.suborder_id,
+                                                    target_2b, ag.id):
+                                                self._assign_agent_to_shelf(
+                                                    ag, pid, next_sub_2b,
+                                                    target_2b, pre_slot_2b)
+                                                assigned = True
+                                                logging.info(
+                                                    f"  ⏩ Конвейер: А{ag.id} → подзаказ "
+                                                    f"#{next_sub_2b.suborder_id} слот {sn_2b} "
+                                                    f"(текущему нужно {reserved_for_current} слотов, "
+                                                    f"свободно {len(free_slots_2b)})")
+                                            else:
+                                                # Откат
+                                                owners_2b[sn_2b] = None
+                                                self.slot_manager.slot_suborder.get(
+                                                    pid, {})[sn_2b] = None
 
         # ── 3. Переходы состояний ────────────────────────────────────────────
+        # Примечание: STATUS_UNLOADING обрабатывается в шаге 0c (до назначения),
+        # чтобы освобождённые слоты были видны шагу 2 в том же тике.
         for ag in self.agents.values():
 
-            if ag.status == STATUS_UNLOADING:
-                ag.unload_timer -= 1
-                if ag.unload_timer <= 0:
-                    pid = ag.current_suborder.packer_id if ag.current_suborder else None
-                    if pid and ag.assigned_slot_num:
-                        self.slot_manager.release_slot(pid, ag.assigned_slot_num)
-                        # НЕ вызываем reorder_queue/_sync_slot_goals:
-                        # _advance_convoy на следующем тике сам продвинет
-                        # следующего агента только после физического освобождения позиции.
-                        # Это обеспечивает строгий конвойный порядок.
-                    ag.status            = STATUS_RETURN_SHELF
-                    ag.goal              = ag.original_shelf_pos
-                    ag.has_cargo         = True
-                    ag.assigned_slot_num = None
-                    ag.shortest_path_len = 0
-                    ag.path              = []
-                    if ag.original_shelf_pos:
-                        self.shelf_states[ag.original_shelf_pos] = 'RETURNING'
-                continue
-
             if ag.status == STATUS_GO_TO_SHELF and ag.goal and ag.pos == ag.goal:
+                # Успешно добрались до стеллажа — сбрасываем счётчик аборт-попыток
+                if ag.original_shelf_pos in self._shelf_abort_count:
+                    self._shelf_abort_count.pop(ag.original_shelf_pos, None)
                 pid = ag.current_suborder.packer_id if ag.current_suborder else None
                 if pid is None:
                     ag.path = []; continue
@@ -605,11 +946,21 @@ class AgentManager:
 
             elif ag.status == STATUS_CARRY_TO_PACKER and ag.goal and ag.pos == ag.goal:
                 if ag.assigned_slot_num == 1:
-                    ag.status       = STATUS_UNLOADING
-                    ag.unload_timer = 5
-                    pid_log = ag.current_suborder.packer_id if ag.current_suborder else '?'
-                    logging.info(f"  📦 Агент {ag.id} разгружается "
-                                 f"(слот 1, фасовщик {pid_log})")
+                    # Ворота разгрузки: разгружаемся только если наш подзаказ активен.
+                    # Защищает от ситуации когда агент следующего подзаказа по конвою
+                    # добрался до слота 1 пока текущий подзаказ ещё в COMPLETING.
+                    _pid_gate   = ag.current_suborder.packer_id if ag.current_suborder else None
+                    _my_sid     = ag.current_suborder.suborder_id if ag.current_suborder else None
+                    _active_sid = (self.dispatcher.active_suborder_id.get(_pid_gate)
+                                   if self.dispatcher and _pid_gate else None)
+                    _can_unload = (_active_sid is None or _active_sid == _my_sid)
+                    if _can_unload:
+                        ag.status       = STATUS_UNLOADING
+                        ag.unload_timer = 5
+                        logging.info(f"  📦 Агент {ag.id} разгружается "
+                                     f"(слот 1, фасовщик {_pid_gate})")
+                    # else: ждём в слоте 1 — остаёмся STATUS_CARRY_TO_PACKER,
+                    # следующий тик проверит снова когда переключится active_suborder_id
                 else:
                     # Агент достиг своего слота в очереди — ждёт продвижения
                     ag.status = STATUS_WAITING_SLOT
@@ -624,6 +975,12 @@ class AgentManager:
                     # оранжевым минимум _SHELF_COOLDOWN_TICKS тиков.
                     self._shelf_cooldown[ag.original_shelf_pos] = (
                         self.current_tick + self._SHELF_COOLDOWN_TICKS)
+                # Освобождаем слот ДО того как обнуляем assigned_slot_num,
+                # иначе slot_owners[N] останется с ID агента и 2a/2b не увидят
+                # свободного слота в следующем тике → freeze следующего подзаказа.
+                if ag.current_suborder and ag.assigned_slot_num is not None:
+                    _ret_pid = ag.current_suborder.packer_id
+                    self.slot_manager.release_slot(_ret_pid, ag.assigned_slot_num)
                 if self.dispatcher and ag.current_suborder:
                     self.dispatcher.complete_agent_in_suborder(
                         ag.current_suborder.suborder_id)
@@ -651,11 +1008,41 @@ class AgentManager:
             if ag.status in (STATUS_UNLOADING, STATUS_IDLE, STATUS_WAITING_SLOT):
                 continue
 
-            # GO_TO_SHELF + REPLAN = агент застрял (путь к стеллажу недостижим).
-            # Abort: возвращаем стеллаж в pending_shelves, слот → свободен, агент → IDLE.
+            # GO_TO_SHELF + REPLAN = агент застрял.
             if ag.status == STATUS_GO_TO_SHELF and actions.get(ag.id) == 'REPLAN':
-                logging.warning(f"  ⚠️ Агент {ag.id}: GO_TO_SHELF застрял → abort")
-                self._abort_go_to_shelf(ag)
+                # Сначала проверяем: стоит ли другой агент на целевой полке?
+                # Агент без груза может находиться на стеллаже — он и блокирует путь.
+                # В этом случае назначаем блокирующего агента перевозчиком этой полки.
+                hijacked = self._try_hijack_blocker(ag)
+                if not hijacked:
+                    logging.warning(f"  ⚠️ Агент {ag.id}: GO_TO_SHELF застрял → abort")
+                    self._abort_go_to_shelf(ag)
+                continue
+
+            # RETURN_SHELF + REPLAN = агент застрял возвращая стеллаж.
+            # Принудительно завершаем возврат: стеллаж → ACTIVE, агент → IDLE.
+            # Без этого active_agents никогда не обнулится → подзаказ вечно COMPLETING.
+            if ag.status == STATUS_RETURN_SHELF and actions.get(ag.id) == 'REPLAN':
+                logging.warning(f"  ⚠️ Агент {ag.id}: RETURN_SHELF застрял → принудительное завершение")
+                if ag.original_shelf_pos:
+                    self.shelf_states[ag.original_shelf_pos] = 'ACTIVE'
+                    self._shelf_cooldown[ag.original_shelf_pos] = (
+                        self.current_tick + self._SHELF_COOLDOWN_TICKS)
+                # Освобождаем слот явно (иначе slot_owners остаётся с ID агента)
+                if ag.current_suborder and ag.assigned_slot_num is not None:
+                    self.slot_manager.release_slot(
+                        ag.current_suborder.packer_id, ag.assigned_slot_num)
+                if self.dispatcher and ag.current_suborder:
+                    self.dispatcher.complete_agent_in_suborder(
+                        ag.current_suborder.suborder_id)
+                ag.status             = STATUS_IDLE
+                ag.goal               = None
+                ag.current_suborder   = None
+                ag.has_cargo          = False
+                ag.original_shelf_pos = None
+                ag.assigned_slot_num  = None
+                ag.shortest_path_len  = 0
+                ag.path               = []
                 continue
 
             returning_shelf = (ag.status == STATUS_RETURN_SHELF)

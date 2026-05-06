@@ -49,7 +49,11 @@ class SubOrder:
     status:         SubOrderStatus  = SubOrderStatus.PENDING
     priority:       int             = 1
     # Сколько агентов сейчас работают над подзаказом (ещё не вернули стеллаж)
-    active_agents:  int             = 0
+    active_agents:     int             = 0
+    # Сколько агентов уже разгрузились у фасовщика и отправлены возвращать стеллаж.
+    # Когда delivered_agents == num_shelves — фасовщик принял всё →
+    # active_suborder_id переключается на следующий подзаказ.
+    delivered_agents:  int             = 0
     # Множество стеллажей, которые ещё не взяты агентами
     pending_shelves: Set[Tuple[int, int]] = field(default_factory=set)
 
@@ -59,6 +63,16 @@ class SubOrder:
     @property
     def required_shelves(self) -> Set[Tuple[int, int]]:
         return {item.shelf_pos for item in self.items}
+
+    @property
+    def num_shelves(self) -> int:
+        """Уникальных стеллажей в подзаказе."""
+        return len(self.required_shelves)
+
+    @property
+    def num_items(self) -> int:
+        """Суммарное количество позиций в подзаказе."""
+        return len(self.items)
 
 
 @dataclass
@@ -77,13 +91,17 @@ class Dispatcher:
     def __init__(self, order_seed: int, inventory_manager,
                  packer_ids: List[int],
                  packer_slots: Optional[Dict[int, int]] = None,
-                 high_priority_threshold: int = 8):
+                 high_priority_threshold: int = 8,
+                 num_orders: int = 100,
+                 max_spawn_tick: int = 5000):
 
         self.order_seed              = order_seed
         self.inventory               = inventory_manager
         self.packer_ids              = packer_ids
         self.packer_slots            = packer_slots or {p: 10 for p in packer_ids}
         self.high_priority_threshold = high_priority_threshold
+        self.num_orders              = num_orders
+        self.max_spawn_tick          = max_spawn_tick
         self.rng                     = random.Random(order_seed)
 
         self.orders:         Dict[int, Order]  = {}
@@ -101,12 +119,14 @@ class Dispatcher:
 
     # ── генерация ─────────────────────────────────────────────────────────────
     def _pre_generate_all_orders(self):
-        spawn_ticks = sorted([self.rng.randint(0, 5000) for _ in range(100)])
+        spawn_ticks = sorted([
+            self.rng.randint(0, self.max_spawn_tick)
+            for _ in range(self.num_orders)
+        ])
         for tick in spawn_ticks:
             self.next_order_id += 1
             pid       = self.rng.choice(self.packer_ids)
             num_items = self.rng.randint(1, 30)
-            # Только 3 вида товаров (0, 1, 2)
             products  = list(range(3)) * (num_items // 3 + 1)
             self.rng.shuffle(products)
 
@@ -119,6 +139,8 @@ class Dispatcher:
                         shelf_pos=self.rng.choice(shelves)
                     ))
 
+            if not items:
+                continue  # пропускаем заказы без стеллажей
             order = Order(order_id=self.next_order_id, spawn_tick=tick,
                           packer_id=pid, items=items)
             self.orders[order.order_id] = order
@@ -186,9 +208,12 @@ class Dispatcher:
         if cur is not None:
             order = self.orders.get(cur)
             if order and order.status != OrderStatus.COMPLETED:
-                return
+                return  # текущий ещё выполняется
+            # Завершён — сбрасываем оба ID
+            self.active_order_id[packer_id]    = None
+            self.active_suborder_id[packer_id] = None
         for order in self.active_queue:
-            if order.packer_id == packer_id:
+            if order.packer_id == packer_id and order.status != OrderStatus.COMPLETED:
                 self.active_order_id[packer_id] = order.order_id
                 logging.info(f"  Фасовщик {packer_id}: активирован заказ #{order.order_id}")
                 return
@@ -196,14 +221,13 @@ class Dispatcher:
 
     def _try_activate_next_suborder(self, packer_id: int):
         """
-        Активирует следующий PENDING подзаказ если текущий достаточно продвинулся.
+        Устанавливает active_suborder_id для фасовщика.
 
-        Правило продвижения:
-          • IN_PROGRESS + pending_shelves НЕ пуст → ждём (агенты ещё не взяли все стеллажи)
-          • IN_PROGRESS + pending_shelves ПУСТ    → можно активировать следующий.
-            Все стеллажи разобраны агентами, свободные слоты (выше текущих агентов)
-            могут занять агенты следующего подзаказа.
-          • COMPLETING / COMPLETED               → обязательно активируем следующий.
+        Правила переключения:
+          • Текущий IN_PROGRESS + pending НЕ пуст  → держим (агенты ещё берут стеллажи)
+          • Текущий IN_PROGRESS + pending пуст      → переключаем на следующий PENDING
+          • Текущий COMPLETING / COMPLETED           → переключаем на следующий PENDING
+          • cur_sid == None                          → ищем первый PENDING
         """
         oid = self.active_order_id.get(packer_id)
         if oid is None:
@@ -216,13 +240,13 @@ class Dispatcher:
 
         cur_sid = self.active_suborder_id.get(packer_id)
         if cur_sid is not None:
-            cur_sub = next((s for s in order.suborders if s.suborder_id == cur_sid), None)
-            if cur_sub and cur_sub.status == SubOrderStatus.IN_PROGRESS:
-                if cur_sub.pending_shelves:
-                    # Ещё есть неразобранные стеллажи — следующий не стартует
-                    return
-                # pending_shelves пуст: все стеллажи взяты, свободные слоты доступны
-                # следующему подзаказу — активируем его.
+            cur_sub = next((s for s in order.suborders
+                            if s.suborder_id == cur_sid), None)
+            if cur_sub is not None and cur_sub.status != SubOrderStatus.COMPLETED:
+                # Держим текущий подзаказ пока он не COMPLETED.
+                # Строгая последовательность: подзаказ N+1 стартует только
+                # когда подзаказ N полностью завершён (active_agents == 0).
+                return
 
         # Ищем следующий PENDING
         for sub in order.suborders:
@@ -230,11 +254,22 @@ class Dispatcher:
                 self.active_suborder_id[packer_id] = sub.suborder_id
                 logging.info(
                     f"  Фасовщик {packer_id}: активирован подзаказ #{sub.suborder_id} "
-                    f"({len(sub.required_shelves)} стеллажей)"
-                )
+                    f"({len(sub.required_shelves)} стеллажей)")
                 return
 
-        # Нет PENDING подзаказов
+        # PENDING нет — ищем IN_PROGRESS с незавершёнными стеллажами.
+        # Такое возникает когда агент был aborted и вернул стеллаж в pending_shelves,
+        # а active_suborder_id успел обнулиться (suborder уже не PENDING, но не COMPLETED).
+        for sub in order.suborders:
+            if (sub.status == SubOrderStatus.IN_PROGRESS
+                    and sub.pending_shelves):
+                self.active_suborder_id[packer_id] = sub.suborder_id
+                logging.info(
+                    f"  ♻️ Фасовщик {packer_id}: восстановлен подзаказ #{sub.suborder_id} "
+                    f"({len(sub.pending_shelves)} стеллажей ещё не взяты)")
+                return
+
+        # Нет ни PENDING ни незавершённых IN_PROGRESS — сбрасываем
         self.active_suborder_id[packer_id] = None
 
     # ── приоритеты ────────────────────────────────────────────────────────────
@@ -321,6 +356,40 @@ class Dispatcher:
                 return True
         return False
 
+    def mark_delivery_complete(self, suborder_id: int) -> bool:
+        """
+        Вызывается когда агент завершил разгрузку у фасовщика (UNLOADING→RETURN_SHELF).
+
+        Агент принят фасовщиком и отправлен возвращать стеллаж.
+        Если ВСЕ агенты подзаказа уже разгружены — подзаказ считается «сданным»:
+        active_suborder_id переключается на следующий СЕЙЧАС, не дожидаясь
+        физического возврата стеллажей. Это даёт непрерывный поток к фасовщику.
+
+        active_agents по-прежнему отслеживается до полного возврата стеллажей
+        (для корректного COMPLETED и финальной статистики).
+        """
+        for order in self.active_queue:
+            for sub in order.suborders:
+                if sub.suborder_id != suborder_id:
+                    continue
+
+                sub.delivered_agents = min(
+                    sub.delivered_agents + 1, sub.num_shelves)
+
+                # Все стеллажи сданы фасовщику?
+                if (sub.delivered_agents >= sub.num_shelves
+                        and not sub.pending_shelves):
+                    pid = order.packer_id
+                    if self.active_suborder_id.get(pid) == suborder_id:
+                        self.active_suborder_id[pid] = None
+                        self._try_activate_next_suborder(pid)
+                        logging.info(
+                            f"  🎉 Подзаказ #{suborder_id}: все стеллажи сданы фасовщику "
+                            f"→ активируем следующий подзаказ "
+                            f"(агенты ещё возвращают стеллажи)")
+                return True
+        return False
+
     def complete_agent_in_suborder(self, suborder_id: int) -> bool:
         """
         Вызывается когда агент вернул стеллаж на место.
@@ -342,10 +411,13 @@ class Dispatcher:
                     logging.info(f"  ✅ Подзаказ #{suborder_id} завершён (заказ #{order.order_id})")
 
                     pid = order.packer_id
+                    # active_suborder_id мог уже переключиться через mark_delivery_complete.
+                    # Сбрасываем только если ещё указывает на этот подзаказ.
                     if self.active_suborder_id.get(pid) == suborder_id:
                         self.active_suborder_id[pid] = None
 
-                    # Сразу пробуем активировать следующий
+                    # Пробуем активировать следующий (если mark_delivery_complete
+                    # ещё не сделал это)
                     self._try_activate_next_suborder(pid)
 
                     if all(s.status == SubOrderStatus.COMPLETED for s in order.suborders):
@@ -358,14 +430,11 @@ class Dispatcher:
                         self._try_activate_next_order(pid)
                         self._try_activate_next_suborder(pid)
                 else:
-                    # Не все агенты вернулись — переходим в COMPLETING
+                    # Не все агенты вернулись — статус COMPLETING.
+                    # active_suborder_id уже переключён через mark_delivery_complete,
+                    # поэтому здесь ничего не трогаем.
                     if sub.status == SubOrderStatus.IN_PROGRESS and not sub.pending_shelves:
                         sub.status = SubOrderStatus.COMPLETING
-                        pid = order.packer_id
-                        # Можно уже брать следующий подзаказ!
-                        if self.active_suborder_id.get(pid) == suborder_id:
-                            self.active_suborder_id[pid] = None
-                        self._try_activate_next_suborder(pid)
                         logging.info(
                             f"  🔄 Подзаказ #{suborder_id} COMPLETING "
                             f"(осталось {sub.active_agents} агентов в пути)"

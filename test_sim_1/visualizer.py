@@ -390,8 +390,8 @@ class PygameVisualizer:
             pygame.draw.circle(self.screen, (255,255,255), (x,   y),   radius, 2)
             if cargo:
                 sq = max(4, cs//4)
-                pygame.draw.rect(self.screen, (255,153,0), (x-sq//2, y-sq//2, sq, sq))
-                pygame.draw.rect(self.screen, (0,0,0),     (x-sq//2, y-sq//2, sq, sq), 1)
+                pygame.draw.rect(self.screen, (255,153,0), (x-sq//2, y+sq//2, sq, sq))
+                pygame.draw.rect(self.screen, (0,0,0),     (x-sq//2, y+sq//2, sq, sq), 1)
             if cs >= 20:
                 t = self.font_agent.render(str(aid), True, (255,255,255))
                 self._blit(t, x-t.get_width()//2, y-t.get_height()//2)

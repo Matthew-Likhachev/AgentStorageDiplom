@@ -10,6 +10,7 @@ import pygame
 import time
 import json
 from pathlib import Path
+from typing import Dict
 
 # Импорты наших модулей
 from import_module import MapImporter
@@ -35,6 +36,12 @@ def main():
         "num_agents": 20,       # Количество агентов
         "high_priority_threshold": 8, # Приоритет >= этого значения прерывает очередь
 
+        # ── Генерация заказов ─────────────────────────────────────────────────
+        # num_orders     — сколько заказов сгенерировать за всю симуляцию
+        # max_spawn_tick — до какого тика включительно появляются заказы
+        "num_orders":     60,    # 60 заказов равномерно до тика 5000
+        "max_spawn_tick": 5000,  # последний возможный тик появления заказа
+
         # ── Алгоритм маршрутизации ────────────────────────────────────────────
         # Выберите один из трёх вариантов:
         #
@@ -53,6 +60,7 @@ def main():
         #                          Хорошо работает при 8-20 агентах.
         #
         "router_algorithm": "lns",
+        "tick_delay_ms":0
     }
 
     # === 2. Импорт карты ===
@@ -98,6 +106,23 @@ def main():
     logging.info(f"   📦 Найдено стеллажей: {len(shelf_positions)}")
     logging.info(f"   📦 Найдено фасовщиков: {len(packer_ids)} (IDs: {packer_ids})")
 
+    # === 3б. Подсчёт Z-слотов для каждого фасовщика ===
+    # Нужно до создания Dispatcher, чтобы размер подзаказа = реальному числу слотов на карте.
+    packer_slots: Dict[int, int] = {}
+    for row in cells:
+        for cell in row:
+            if cell['type'] == 'Z':
+                parts = cell['text'].split('|')
+                try:
+                    logic = json.loads(parts[3]) if len(parts) > 3 else {}
+                    pid   = logic.get('packer_id')
+                    zone  = logic.get('zone', 'order')
+                    if pid is not None and zone == 'order':
+                        packer_slots[pid] = packer_slots.get(pid, 0) + 1
+                except Exception:
+                    pass
+    logging.info(f"   📦 Z-слотов по фасовщикам: {packer_slots}")
+
     if not shelf_positions:
         logging.error("❌ На карте не найдено ни одного стеллажа (тип S)")
         sys.exit(1)
@@ -125,8 +150,12 @@ def main():
         order_seed=config["order_seed"],
         inventory_manager=inventory,
         packer_ids=packer_ids if packer_ids else [1],
-        high_priority_threshold=config["high_priority_threshold"] # Передаем порог приоритета
+        packer_slots=packer_slots if packer_slots else None,
+        high_priority_threshold=config["high_priority_threshold"],
+        num_orders=config["num_orders"],
+        max_spawn_tick=config["max_spawn_tick"],
     )
+    logging.info(f"   📋 Заказов: {config['num_orders']} до тика {config['max_spawn_tick']}")
 
     # 4.4 Маршрутизатор — выбирается из конфига ("router_algorithm")
     _router_name = config["router_algorithm"]
@@ -170,7 +199,7 @@ def main():
     # === 5. Главный цикл симуляции ===
     logging.info("🎮 Запуск цикла симуляции (SPACE - пауза, ESC - выход)")
     tick = 0
-    max_ticks = 10000  # Ограничитель для демо (заказы заканчиваются к 5000)
+    max_ticks = 6000  # Ограничитель для демо (заказы заканчиваются к 5000)
 
     try:
         while visual.running:
@@ -206,6 +235,11 @@ def main():
                         'suborder_id': sub.suborder_id,
                         'active':      (sub.suborder_id == cur_sid),
                         'items':       items_count,
+                        'num_shelves': sub.num_shelves,
+                        'num_items':   sub.num_items,
+                        'status':      sub.status.value,
+                        'num_pending': len(sub.pending_shelves),
+                        'num_active':  sub.active_agents,
                     })
 
             # active_info: текущий заказ, подзаказ, слоты, очередь для каждого фасовщика
@@ -234,8 +268,12 @@ def main():
             visual.on_state_change(state)
             visual.update()
 
+            # if tick % 50 == 0:
+            agent_manager.print_order_summary()
+
             tick += 1
-            # time.sleep(0.09)  # Задержка для комфортного просмотра (20 тактов/сек)
+            if config.get("tick_delay_ms", 90) > 0:
+                time.sleep(config.get("tick_delay_ms", 90) / 1000.0)
 
             if tick >= max_ticks:
                 logging.info(f"🏁 Демо-лимит ({max_ticks} тактов) достигнут.")

@@ -84,6 +84,21 @@ class DeadlockResolver:
         self._stat_cycles_detected: int = 0
         self._stat_cycles_resolved: int = 0
 
+        # Level 1 oscillation detection
+        self._POS_HISTORY_LEN: int               = 6     # длина окна истории
+        self._OSC_THRESHOLD:   int               = 4     # тактов осцилляции до REPLAN
+        self._pos_history: Dict[int, list]       = {}    # {agent_id: [pos, ...]}
+        self._osc_since:   Dict[int, int]        = {}    # {agent_id: tick_first_osc}
+
+        # Force-wait: агент принудительно стоит N тиков после REPLAN из-за осцилляции.
+        # Ключ = agent_id, значение = тик до которого стоять.
+        # Предотвращает повторную осцилляцию: другой агент за это время проходит мимо.
+        self._force_wait_until: Dict[int, int]   = {}
+        self._FORCE_WAIT_TICKS: int              = 6
+        # Счётчик повторных осцилляций: если агент осциллирует снова после wait,
+        # wait удлиняется и стагерируется по ID (чтобы не все перезапустились вместе).
+        self._osc_repeat_count: Dict[int, int]   = {}
+
     def _find_chain_push(
             self,
             start_pos:   Tuple[int, int],
@@ -166,34 +181,103 @@ class DeadlockResolver:
 
     def update_last_move(self, agents: Dict[int, Any], current_tick: int):
         """Вызывать ПОСЛЕ move() в конце тика."""
+        from collections import deque
         for aid, ag in agents.items():
             if ag.status in _STATIONARY_STATUSES:
                 self.last_pos[aid]    = ag.pos
                 self.stuck_since[aid] = current_tick
+                self._osc_since.pop(aid, None)
+                self._pos_history.pop(aid, None)
                 continue
+
+            # Обычный таймер застревания
             if self.last_pos.get(aid) != ag.pos:
                 self.stuck_since[aid] = current_tick
+                # Агент успешно двинулся — снижаем счётчик повторений осцилляции
+                if aid in self._osc_repeat_count:
+                    self._osc_repeat_count[aid] = max(0, self._osc_repeat_count[aid] - 1)
+                    if self._osc_repeat_count[aid] == 0:
+                        self._osc_repeat_count.pop(aid, None)
             elif aid not in self.stuck_since:
                 self.stuck_since[aid] = current_tick
             self.last_pos[aid] = ag.pos
+
+            # История позиций для детектирования осцилляции
+            hist = self._pos_history.setdefault(aid, [])
+            hist.append(ag.pos)
+            if len(hist) > self._POS_HISTORY_LEN:
+                hist.pop(0)
+
+            # Детектируем осцилляцию: цикл длиной 2 (A B A B A B)
+            # или длиной 4 (A B C D A B C D)
+            oscillating = False
+            if len(hist) >= 4:
+                # Цикл-2: pos[i] == pos[i-2] для последних 4 позиций
+                if hist[-1] == hist[-3] and hist[-2] == hist[-4]:
+                    oscillating = True
+            if not oscillating and len(hist) >= self._POS_HISTORY_LEN:
+                # Цикл-4: первые 3 == последние 3 в окне 6
+                half = self._POS_HISTORY_LEN // 2
+                if hist[:half] == hist[half:]:
+                    oscillating = True
+
+            if oscillating:
+                if aid not in self._osc_since:
+                    self._osc_since[aid] = current_tick
+            else:
+                self._osc_since.pop(aid, None)
 
     def check_and_resolve(self,
                           agents: Dict[int, Any],
                           reservations: Dict,
                           current_tick: int) -> Dict[int, str]:
         """
-        Уровень 1: таймер застревания.
+        Уровень 1: таймер застревания + детектирование осцилляции.
         Вызывать ДО router.solve().
-        Возвращает {agent_id: 'OK' | 'REPLAN'}.
+        Возвращает {agent_id: 'OK' | 'REPLAN' | 'WAIT'}.
+
+        'WAIT' — агент должен стоять на месте этот тик (не планировать путь).
+        Используется для прерывания ping-pong осцилляции.
         """
         actions = {aid: "OK" for aid in agents}
         for aid, ag in agents.items():
             if ag.status in _STATIONARY_STATUSES:
                 continue
+
+            # Force-wait: агент обязан стоять (после осцилляционного REPLAN)
+            if current_tick < self._force_wait_until.get(aid, 0):
+                actions[aid] = "WAIT"
+                continue
+
+            # Стандартный таймер (агент не двигается)
             stuck_for = current_tick - self.stuck_since.get(aid, current_tick)
             if stuck_for > self.stuck_threshold:
                 actions[aid] = "REPLAN"
                 logging.debug(f"⚠️ [L1] Агент {aid} застрял {stuck_for} тактов → REPLAN")
+                continue
+
+            # Осцилляция (агент движется но не продвигается: A→B→A→B)
+            osc_for = current_tick - self._osc_since.get(aid, current_tick)
+            if osc_for >= self._OSC_THRESHOLD:
+                actions[aid] = "REPLAN"
+                # Считаем повторения осцилляции для этого агента
+                repeat = self._osc_repeat_count.get(aid, 0) + 1
+                self._osc_repeat_count[aid] = repeat
+                # Удлиняем wait при повторах: 6, 10, 14, ...
+                # Стагерируем по agent_id чтобы группа не перезапускалась одновременно
+                wait_base  = self._FORCE_WAIT_TICKS + (repeat - 1) * 4
+                wait_jitter = aid % 4        # 0..3 тика смещения по ID
+                total_wait  = wait_base + wait_jitter
+                self._force_wait_until[aid] = current_tick + total_wait
+                # Сбрасываем историю
+                self._pos_history.pop(aid, None)
+                self._osc_since.pop(aid, None)
+                self.stuck_since[aid] = current_tick
+                logging.warning(
+                    f"⚠️ [L1-OSC] Агент {aid} осциллирует "
+                    f"{osc_for} тактов → REPLAN + WAIT {total_wait} тактов "
+                    f"(повтор #{repeat})")
+
         return actions
 
     # ══════════════════════════════════════════════════════════════════════════
