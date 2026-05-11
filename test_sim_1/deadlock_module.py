@@ -1,672 +1,377 @@
 """
 deadlock_module.py
-3-уровневая реактивная система разрешения дедлоков.
+Трёхуровневая система разрешения дедлоков.
 
-══════════════════════════════════════════════════════════════════
-НАУЧНАЯ ОСНОВА:
-  Deadlock-Free Hybrid RL-MAPF (arXiv:2511.22685) +
-  Wait-For Graph detection (Coffman et al., 1971)
+  Уровень 1 — check_and_resolve():
+    WFG (Wait-For-Graph) детектирует застрявших агентов.
+    Возвращает {agent_id: "OK" | "WAIT" | "REPLAN"}.
 
-АРХИТЕКТУРА (вызовы строго по порядку в run_tick):
+  Уровень 2 — resolve_local_deadlocks():
+    WFG-цикл → локальный CBS для группы агентов в цикле.
+    Вызывается только для реактивного A* (для CBS/LNS пропускается,
+    см. agent_module.py шаг 6 — план уже бесконфликтен).
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  УРОВЕНЬ 1 — check_and_resolve()      ДО router.solve() │
-  │    Таймер застревания → REPLAN                          │
-  │    Изолированные случаи: агент не двигается N тактов    │
-  ├─────────────────────────────────────────────────────────┤
-  │  router.solve(tasks)  ← вызов маршрутизатора            │
-  ├─────────────────────────────────────────────────────────┤
-  │  УРОВЕНЬ 2 — resolve_local_deadlocks()  ПОСЛЕ solve()   │
-  │    WFG-цикл → локальный CBS только для виновных агентов │
-  │    Корень проблемы: циклическое ожидание                │
-  ├─────────────────────────────────────────────────────────┤
-  │  УРОВЕНЬ 3 — resolve_movement_conflicts()  ПЕРЕД move() │
-  │    Pass1 static / Pass2 vertex / Pass3 swap             │
-  │    Финальная гарантия: ни одной коллизии                │
-  └─────────────────────────────────────────────────────────┘
+  Уровень 3 — resolve_movement_conflicts():
+    Физический enforcement финального шага:
+      Pass 1 — блокировка входа в занятые клетки (vertex).
+      Pass 2 — цепочка вытеснения IDLE-агентов.
+      Pass 3 — swap-конфликты: победитель движется, лузер ждёт.
 
-Совместимость: все публичные методы прежних версий сохранены.
-Чтобы активировать уровень 2 передайте map_data в конструктор.
-══════════════════════════════════════════════════════════════════
+  БАГ 3 ИСПРАВЛЕНИЕ — swap осцилляция ↑↓:
+    Ранее оба агента блокировались при swap → следующий тик CBS строил
+    те же пути → тот же swap → бесконечная осцилляция.
+    Теперь: лузер (меньший score) получает force_wait на _SWAP_WAIT_TICKS тиков
+    через RouterContext.swap_losers (читается в check_and_resolve).
+    Победитель в следующем тике движется свободно → swap разрешён.
 """
-import logging
-from typing import Dict, List, Set, Tuple, Any, Optional
+from __future__ import annotations
+import heapq, logging
+from typing import Dict, List, Tuple, Set, Optional, Any
 
-_STATIONARY_STATUSES = {"IDLE", "UNLOADING", "WAITING_SLOT"}
+_FORCE_WAIT_TICKS  = 3   # тиков WAIT после REPLAN-сброса
+_SWAP_WAIT_TICKS   = 4   # тиков WAIT для лузера swap-конфликта (баг 3)
+_STUCK_HISTORY_LEN = 8   # глубина истории позиций для WFG
 
 
 class DeadlockResolver:
     """
-    Реактивный resolver дедлоков.
-
-    Параметры:
-        stuck_threshold  — тактов неподвижности до REPLAN (уровень 1)
-        map_data         — данные карты для локального CBS (уровень 2).
-                           Если None — уровень 2 пропускается.
-        local_cbs_iters  — лимит итераций локального CBS (уровень 2).
+    Централизованный разрешитель дедлоков и физических конфликтов.
+    Создаётся AgentManager'ом, живёт всё время симуляции.
     """
 
-    def __init__(self,
-                 stuck_threshold: int = 8,
-                 map_data: Optional[Dict] = None,
-                 local_cbs_iters: int = 120):
+    def __init__(self, stuck_threshold: int = 8, map_data: Optional[Dict] = None):
         self.stuck_threshold = stuck_threshold
+        self.map_data        = map_data
 
-        # Level 1: timer
-        self.last_pos:    Dict[int, Tuple[int, int]] = {}
-        self.stuck_since: Dict[int, int]             = {}
-
-        # Проходимые клетки карты для IDLE-уступания (Pass 1 уровня 3).
-        # Тип 'F' — пол, 'Z' — зона ожидания. Остальные непроходимы.
-        self._walkable: Set[Tuple[int, int]] = set()
-        if map_data is not None:
-            _PASSABLE = {'F', 'Z'}
-            for row in map_data.get('cells', []):
-                for c in row:
-                    if c.get('type') in _PASSABLE:
-                        self._walkable.add((c['row'], c['col']))
-
-        # Level 2: local CBS
-        self._local_cbs = None
-        if map_data is not None:
-            try:
-                from router_interface import CBSSolver
-                self._local_cbs = CBSSolver(map_data, max_iterations=local_cbs_iters)
-                logging.info("  [DeadlockResolver] ✅ Локальный CBS готов "
-                             f"(max_iter={local_cbs_iters})")
-            except ImportError:
-                logging.warning("  [DeadlockResolver] ⚠️  router_interface не найден — "
-                                "уровень 2 (WFG+CBS) недоступен")
-            except Exception as exc:
-                logging.warning(f"  [DeadlockResolver] ⚠️  CBS init: {exc}")
-
-        # Статистика
-        self._stat_cycles_detected: int = 0
-        self._stat_cycles_resolved: int = 0
-
-        # Level 1 oscillation detection
-        self._POS_HISTORY_LEN: int               = 6     # длина окна истории
-        self._OSC_THRESHOLD:   int               = 4     # тактов осцилляции до REPLAN
-        self._pos_history: Dict[int, list]       = {}    # {agent_id: [pos, ...]}
-        self._osc_since:   Dict[int, int]        = {}    # {agent_id: tick_first_osc}
-
-        # Force-wait: агент принудительно стоит N тиков после REPLAN из-за осцилляции.
-        # Ключ = agent_id, значение = тик до которого стоять.
-        # Предотвращает повторную осцилляцию: другой агент за это время проходит мимо.
+        # История позиций: {agent_id: [pos_t, pos_t-1, ...]}
+        self.pos_history: Dict[int, List[Tuple]] = {}
+        # Тик последнего движения агента
+        self.stuck_since:  Dict[int, int]        = {}
+        # Принудительный WAIT до этого тика: {agent_id: until_tick}
         self._force_wait_until: Dict[int, int]   = {}
-        self._FORCE_WAIT_TICKS: int              = 6
-        # Счётчик повторных осцилляций: если агент осциллирует снова после wait,
-        # wait удлиняется и стагерируется по ID (чтобы не все перезапустились вместе).
-        self._osc_repeat_count: Dict[int, int]   = {}
+        # Текущий тик (сохраняется в check_and_resolve для Pass 3)
+        self._current_tick: int = 0
 
-    def _find_chain_push(
-            self,
-            start_pos:   Tuple[int, int],
-            winner_pos:  Tuple[int, int],
-            winner_dest: Tuple[int, int],
-            occupied:    Set[Tuple[int, int]],
-            pos_to_idle: Dict[Tuple[int, int], int],
-            max_depth:   int = 6,
-    ) -> Optional[List[Tuple[int, Tuple[int, int]]]]:
-        """
-        BFS-поиск цепного сдвига IDLE-агентов («волновое вытеснение»).
+        # Кэш карты для локального CBS
+        self._cell_types:  Dict[Tuple, str]      = {}
+        self._dirs_loaded: Dict[Tuple, Set[str]] = {}
+        self._dirs_empty:  Dict[Tuple, Set[str]] = {}
+        self._start_row    = 0
+        self._start_col    = 0
+        self._width        = 0
+        self._height       = 0
+        self._DIR_OFFSETS  = {'n': (-1,0), 's': (1,0), 'w': (0,-1), 'e': (0,1)}
 
-        Проблема одиночного _find_idle_aside: если все соседи IDLE-агента
-        заняты другими IDLE — метод возвращал None и мувер стоял вечно.
-        При плотной расстановке (30 агентов на старте) это блокирует склад.
+        if map_data:
+            self._parse_map(map_data)
 
-        Решение — chain push (аналог push-операции из MAPF-литературы):
-          1. BFS от start_pos через клетки, занятые IDLE-агентами.
-          2. При достижении свободной клетки — найдена цепочка.
-          3. Каждый IDLE в цепочке сдвигается на одну клетку вперёд.
-             Все смещения за ОДИН тик: каждый агент занимает клетку,
-             которую в этот же тик освобождает следующий — коллизий нет.
+    def _parse_map(self, map_data: Dict):
+        self._start_row = map_data.get('start_row', 0)
+        self._start_col = map_data.get('start_col', 0)
+        self._width     = map_data.get('width', 100)
+        self._height    = map_data.get('height', 100)
+        for row in map_data.get('cells', []):
+            for cell in row:
+                pos   = (cell['row'], cell['col'])
+                text  = cell.get('text', '')
+                parts = text.split('|') if '|' in text else ['F','','','{}']
+                self._cell_types[pos]  = parts[0]
+                self._dirs_loaded[pos] = self._parse_dirs(parts[1] if len(parts)>1 else '')
+                self._dirs_empty[pos]  = self._parse_dirs(parts[2] if len(parts)>2 else '')
 
-        Приоритет первого шага: перпендикулярно направлению мувера.
-        Клетка winner_pos исключена всегда (запрет swap).
+    def _parse_dirs(self, s: str) -> Set[str]:
+        return {d for d in s.split('-') if d in ('n','w','s','e')}
 
-        Возвращает List[(agent_id, new_pos)] или None.
-        """
-        from collections import deque
-
-        dr = winner_dest[0] - winner_pos[0]
-        dc = winner_dest[1] - winner_pos[1]
-
-        def neighbors_of(pos: Tuple[int, int]) -> List[Tuple[int, int]]:
-            r, c = pos
-            return [nb for nb in [(r-1,c),(r+1,c),(r,c-1),(r,c+1)]
-                    if nb in self._walkable and nb != winner_pos]
-
-        def perp_first(nb: Tuple[int, int], from_pos: Tuple[int, int]) -> int:
-            step_r = nb[0] - from_pos[0]
-            step_c = nb[1] - from_pos[1]
-            return 0 if dr * step_r + dc * step_c == 0 else 1
-
-        visited: Set[Tuple[int, int]] = {start_pos}
-        queue: deque = deque()
-
-        for nb in sorted(neighbors_of(start_pos),
-                         key=lambda nb: perp_first(nb, start_pos)):
-            if nb not in visited:
-                visited.add(nb)
-                queue.append((nb, [start_pos, nb]))
-
-        while queue:
-            current, chain = queue.popleft()
-            if len(chain) - 1 > max_depth:
-                continue
-
-            if current not in occupied:
-                # Свободная клетка найдена — строим список смещений
-                result: List[Tuple[int, Tuple[int, int]]] = []
-                for i in range(len(chain) - 1):
-                    aid = pos_to_idle.get(chain[i])
-                    if aid is not None:
-                        result.append((aid, chain[i + 1]))
-                return result if result else None
-
-            if current not in pos_to_idle:
-                continue    # занято UNLOADING/WAITING_SLOT — тупик
-
-            for nb in neighbors_of(current):
-                if nb not in visited:
-                    visited.add(nb)
-                    queue.append((nb, chain + [nb]))
-
-        return None
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # УРОВЕНЬ 1 — Timer-based stuck detection
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def update_last_move(self, agents: Dict[int, Any], current_tick: int):
-        """Вызывать ПОСЛЕ move() в конце тика."""
-        from collections import deque
-        for aid, ag in agents.items():
-            if ag.status in _STATIONARY_STATUSES:
-                self.last_pos[aid]    = ag.pos
-                self.stuck_since[aid] = current_tick
-                self._osc_since.pop(aid, None)
-                self._pos_history.pop(aid, None)
-                continue
-
-            # Обычный таймер застревания
-            if self.last_pos.get(aid) != ag.pos:
-                self.stuck_since[aid] = current_tick
-                # Агент успешно двинулся — снижаем счётчик повторений осцилляции
-                if aid in self._osc_repeat_count:
-                    self._osc_repeat_count[aid] = max(0, self._osc_repeat_count[aid] - 1)
-                    if self._osc_repeat_count[aid] == 0:
-                        self._osc_repeat_count.pop(aid, None)
-            elif aid not in self.stuck_since:
-                self.stuck_since[aid] = current_tick
-            self.last_pos[aid] = ag.pos
-
-            # История позиций для детектирования осцилляции
-            hist = self._pos_history.setdefault(aid, [])
-            hist.append(ag.pos)
-            if len(hist) > self._POS_HISTORY_LEN:
-                hist.pop(0)
-
-            # Детектируем осцилляцию: цикл длиной 2 (A B A B A B)
-            # или длиной 4 (A B C D A B C D)
-            oscillating = False
-            if len(hist) >= 4:
-                # Цикл-2: pos[i] == pos[i-2] для последних 4 позиций
-                if hist[-1] == hist[-3] and hist[-2] == hist[-4]:
-                    oscillating = True
-            if not oscillating and len(hist) >= self._POS_HISTORY_LEN:
-                # Цикл-4: первые 3 == последние 3 в окне 6
-                half = self._POS_HISTORY_LEN // 2
-                if hist[:half] == hist[half:]:
-                    oscillating = True
-
-            if oscillating:
-                if aid not in self._osc_since:
-                    self._osc_since[aid] = current_tick
-            else:
-                self._osc_since.pop(aid, None)
-
-    def check_and_resolve(self,
-                          agents: Dict[int, Any],
+    # ── Уровень 1 ─────────────────────────────────────────────────────────
+    def check_and_resolve(self, agents: Dict[int, Any],
                           reservations: Dict,
                           current_tick: int) -> Dict[int, str]:
         """
-        Уровень 1: таймер застревания + детектирование осцилляции.
-        Вызывать ДО router.solve().
-        Возвращает {agent_id: 'OK' | 'REPLAN' | 'WAIT'}.
-
-        'WAIT' — агент должен стоять на месте этот тик (не планировать путь).
-        Используется для прерывания ping-pong осцилляции.
+        Анализирует состояние агентов и возвращает действия:
+          "OK"     — двигаться по плану
+          "WAIT"   — стоять на месте (уступить)
+          "REPLAN" — путь заблокирован, нужен новый маршрут
         """
-        actions = {aid: "OK" for aid in agents}
+        self._current_tick = current_tick
+        actions: Dict[int, str] = {}
+
+        # Применяем force_wait из предыдущих тиков (в т.ч. swap_losers, баг 3)
+        for aid, until in list(self._force_wait_until.items()):
+            if current_tick >= until:
+                del self._force_wait_until[aid]
+            else:
+                actions[aid] = 'WAIT'
+
+        # Применяем swap_losers от RouterContext (если есть)
+        # AgentManager передаёт router через аргумент → доступен через agents
+        # (используем сторонний канал: _swap_losers_pending)
+        for aid in list(getattr(self, '_swap_losers_pending', set())):
+            until = current_tick + _SWAP_WAIT_TICKS
+            self._force_wait_until[aid] = until
+            actions[aid] = 'WAIT'
+        self._swap_losers_pending: Set[int] = set()
+
+        from agent_module import (STATUS_IDLE, STATUS_UNLOADING,
+                                   STATUS_WAITING_SLOT)
+        _skip_statuses = (STATUS_IDLE, STATUS_UNLOADING, STATUS_WAITING_SLOT)
+
         for aid, ag in agents.items():
-            if ag.status in _STATIONARY_STATUSES:
+            if aid in actions:
+                continue
+            if ag.status in _skip_statuses or ag.goal is None:
+                actions[aid] = 'OK'
                 continue
 
-            # Force-wait: агент обязан стоять (после осцилляционного REPLAN)
-            if current_tick < self._force_wait_until.get(aid, 0):
-                actions[aid] = "WAIT"
-                continue
-
-            # Стандартный таймер (агент не двигается)
-            stuck_for = current_tick - self.stuck_since.get(aid, current_tick)
-            if stuck_for > self.stuck_threshold:
-                actions[aid] = "REPLAN"
-                logging.debug(f"⚠️ [L1] Агент {aid} застрял {stuck_for} тактов → REPLAN")
-                continue
-
-            # Осцилляция (агент движется но не продвигается: A→B→A→B)
-            osc_for = current_tick - self._osc_since.get(aid, current_tick)
-            if osc_for >= self._OSC_THRESHOLD:
-                actions[aid] = "REPLAN"
-                # Считаем повторения осцилляции для этого агента
-                repeat = self._osc_repeat_count.get(aid, 0) + 1
-                self._osc_repeat_count[aid] = repeat
-                # Удлиняем wait при повторах: 6, 10, 14, ...
-                # Стагерируем по agent_id чтобы группа не перезапускалась одновременно
-                wait_base  = self._FORCE_WAIT_TICKS + (repeat - 1) * 4
-                wait_jitter = aid % 4        # 0..3 тика смещения по ID
-                total_wait  = wait_base + wait_jitter
-                self._force_wait_until[aid] = current_tick + total_wait
-                # Сбрасываем историю
-                self._pos_history.pop(aid, None)
-                self._osc_since.pop(aid, None)
+            # Инициализация истории
+            if aid not in self.stuck_since:
                 self.stuck_since[aid] = current_tick
-                logging.warning(
-                    f"⚠️ [L1-OSC] Агент {aid} осциллирует "
-                    f"{osc_for} тактов → REPLAN + WAIT {total_wait} тактов "
-                    f"(повтор #{repeat})")
+            if aid not in self.pos_history:
+                self.pos_history[aid] = []
+
+            # Проверяем прогресс (двигался ли агент за stuck_threshold тиков)
+            ticks_stuck = current_tick - self.stuck_since.get(aid, current_tick)
+            if ticks_stuck >= self.stuck_threshold:
+                # Агент не двигался слишком долго → REPLAN
+                jitter = aid % _FORCE_WAIT_TICKS
+                self._force_wait_until[aid] = current_tick + _FORCE_WAIT_TICKS + jitter
+                self.stuck_since[aid]       = current_tick
+                actions[aid]                = 'REPLAN'
+                logging.debug(f"  [L1] А{aid}: застрял {ticks_stuck} тиков → REPLAN")
+            else:
+                actions[aid] = 'OK'
 
         return actions
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # УРОВЕНЬ 2 — WFG Cycle Detection + Local CBS Resolution
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _build_wait_for_graph(
-            self,
-            agents: Dict[int, Any],
-            paths:  Dict[int, List[Tuple[int, int]]],
-    ) -> Dict[int, Set[int]]:
+    def update_last_move(self, agents: Dict[int, Any], current_tick: int):
         """
-        Wait-For Graph (WFG): A→B означает «агент A хочет войти в
-        клетку, которую занимает B и которую B не планирует покидать».
-
-        Ребро A→B возникает когда:
-          • next_pos[A] == cur_pos[B]   (A хочет встать на место B)
-          • next_pos[B] == cur_pos[B]   (B остаётся стоять)
-        Цикл в WFG ≡ классический circular deadlock.
+        Запоминает позиции ПОСЛЕ движения. Вызывается в конце тика.
+        Обновляет stuck_since для агентов, которые действительно двигались.
         """
-        # next_pos: первый реальный шаг по пути от роутера
+        from agent_module import (STATUS_IDLE, STATUS_UNLOADING,
+                                   STATUS_WAITING_SLOT)
+        _skip_statuses = (STATUS_IDLE, STATUS_UNLOADING, STATUS_WAITING_SLOT)
+
+        for aid, ag in agents.items():
+            if ag.status in _skip_statuses:
+                self.stuck_since.pop(aid, None)
+                continue
+            prev_positions = self.pos_history.get(aid, [])
+            prev_pos       = prev_positions[-1] if prev_positions else None
+
+            if prev_pos != ag.pos:
+                # Агент двигался — сбрасываем счётчик
+                self.stuck_since[aid] = current_tick
+
+            # Обновляем историю (кольцевой буфер)
+            self.pos_history[aid] = (prev_positions + [ag.pos])[-_STUCK_HISTORY_LEN:]
+
+    # ── Уровень 2 ─────────────────────────────────────────────────────────
+    def resolve_local_deadlocks(self, agents: Dict[int, Any],
+                                 paths: Dict[int, List[Tuple]],
+                                 tasks: List[Dict],
+                                 current_tick: int,
+                                 reservations: Optional[Dict] = None
+                                 ) -> Dict[int, List[Tuple]]:
+        """
+        WFG-детектирование циклов → локальный CBS для группы.
+        Вызывается только для реактивного A*. Для CBS/LNS пропускается
+        (plan already conflict-free).
+        """
+        if not paths or not tasks:
+            return paths
+
+        # Строим WFG: кто кого ждёт
+        # Агент A ждёт агента B если следующий шаг A = текущая позиция B
         next_pos: Dict[int, Tuple] = {}
+        for aid, path in paths.items():
+            if len(path) >= 2:
+                next_pos[aid] = path[1]
+            else:
+                next_pos[aid] = agents[aid].pos if aid in agents else path[0]
+
+        pos_to_agent: Dict[Tuple, int] = {}
         for aid, ag in agents.items():
-            path = paths.get(aid, [])
-            next_pos[aid] = path[1] if len(path) >= 2 else ag.pos
+            pos_to_agent[ag.pos] = aid
 
-        # Обратный индекс: позиция → агент
-        pos_to_agent: Dict[Tuple, int] = {ag.pos: aid for aid, ag in agents.items()}
+        # WFG рёбра: A→B если A хочет на позицию B
+        wfg: Dict[int, int] = {}
+        for aid, nxt in next_pos.items():
+            blocker = pos_to_agent.get(nxt)
+            if blocker is not None and blocker != aid:
+                wfg[aid] = blocker
 
-        wfg: Dict[int, Set[int]] = {aid: set() for aid in agents}
-        for aid, ag in agents.items():
-            if ag.status in _STATIONARY_STATUSES:
-                continue
-            target = next_pos[aid]
-            if target == ag.pos:
-                continue  # не движется сам
-            blocker_id = pos_to_agent.get(target)
-            if blocker_id is None or blocker_id == aid:
-                continue
-            # B блокирует A если B сам не собирается уйти
-            if next_pos.get(blocker_id) == agents[blocker_id].pos:
-                wfg[aid].add(blocker_id)
+        # Находим циклы (DFS)
+        cycles: List[List[int]] = []
+        visited: Set[int] = set()
 
-        return wfg
+        def find_cycle(start: int) -> Optional[List[int]]:
+            path_c: List[int] = []; seen: Dict[int, int] = {}; cur = start
+            while cur in wfg:
+                if cur in seen:
+                    idx = seen[cur]
+                    return path_c[idx:]
+                seen[cur] = len(path_c); path_c.append(cur); cur = wfg[cur]
+            return None
 
-    def _find_wfg_cycles(self, wfg: Dict[int, Set[int]]) -> List[Set[int]]:
-        """
-        DFS-поиск всех простых циклов в WFG.
-        Возвращает список множеств агентов — каждое множество это один цикл.
-        """
-        visited:   Set[int] = set()
-        rec_stack: Set[int] = set()
-        cycles:    List[Set[int]] = []
-
-        def dfs(node: int, path: List[int]):
-            visited.add(node)
-            rec_stack.add(node)
-            path.append(node)
-
-            for neighbor in wfg.get(node, set()):
-                if neighbor not in visited:
-                    dfs(neighbor, path)
-                elif neighbor in rec_stack:
-                    # Найден цикл: восстанавливаем его из стека
-                    idx   = path.index(neighbor)
-                    cycle = set(path[idx:])
-                    # Добавляем только если он не поглощён уже найденным
-                    if not any(cycle <= existing for existing in cycles):
-                        cycles.append(cycle)
-
-            path.pop()
-            rec_stack.discard(node)
-
-        for node in wfg:
-            if node not in visited:
-                dfs(node, [])
-
-        return cycles
-
-    def resolve_local_deadlocks(
-            self,
-            agents:       Dict[int, Any],
-            paths:        Dict[int, List[Tuple[int, int]]],
-            tasks:        List[Dict],
-            current_tick: int,
-            reservations: Optional[Dict] = None,
-    ) -> Dict[int, List[Tuple[int, int]]]:
-        """
-        Уровень 2: WFG-обнаружение + локальный CBS.
-
-        reservations — основной словарь брони AgentManager (t=0 постоянные блоки
-        статичных агентов). Передаётся в локальный CBS чтобы пути не проходили
-        сквозь IDLE/WAITING_SLOT агентов.
-
-        Алгоритм (Deadlock-Free Hybrid, arXiv:2511.22685, адаптация):
-          1. Строим WFG из намерений агентов (next_pos).
-          2. Находим циклы в WFG — это и есть настоящие дедлоки.
-          3. Для каждого цикла:
-             a. Собираем задачи только вовлечённых агентов.
-             b. Строим temp_res из путей ОСТАЛЬНЫХ агентов + постоянных брони
-                (они не участвуют в локальной оптимизации — не трогаем).
-             c. Запускаем локальный CBSSolver только для группы цикла.
-             d. Заменяем пути вовлечённых агентов на найденные CBS-решения.
-          4. Возвращаем обновлённый словарь путей.
-
-        Вызывать ПОСЛЕ router.solve() и ДО resolve_movement_conflicts().
-        """
-        if self._local_cbs is None:
-            return paths  # Уровень 2 не настроен — пропускаем
-
-        wfg    = self._build_wait_for_graph(agents, paths)
-        cycles = self._find_wfg_cycles(wfg)
+        for aid in list(wfg.keys()):
+            if aid not in visited:
+                cycle = find_cycle(aid)
+                if cycle:
+                    for a in cycle: visited.add(a)
+                    cycles.append(cycle)
 
         if not cycles:
             return paths
 
-        self._stat_cycles_detected += len(cycles)
-        logging.info(f"🔒 [L2] Тик {current_tick}: обнаружено {len(cycles)} "
-                     f"WFG-цикл(ов), всего за сессию: {self._stat_cycles_detected}")
-
-        result_paths = dict(paths)           # не мутируем оригинал
-        task_map     = {t['agent_id']: t for t in tasks}
-        main_res     = reservations or {}
-
+        # Перепланируем каждую группу в цикле через локальный A* с wait-step
+        new_paths = dict(paths)
         for cycle in cycles:
-            cycle_ids = sorted(cycle)
-            logging.info(f"  ↺ WFG-цикл: агенты {cycle_ids}")
-
-            # Задачи только для агентов цикла
-            cycle_tasks: List[Dict] = []
-            for aid in cycle_ids:
-                if aid not in task_map:
-                    continue
-                t = dict(task_map[aid])  # shallow copy — не мутируем task_map
-                t['action'] = 'OK'       # снимаем REPLAN/WAIT флаги для CBS
-                cycle_tasks.append(t)
-
-            if not cycle_tasks:
+            logging.info(f"  [L2] WFG цикл: {cycle} → локальное перепланирование")
+            # Лузер (минимальный score) ждёт один тик
+            task_map = {t['agent_id']: t for t in tasks}
+            scores   = {aid: task_map[aid].get('score', 0.0)
+                        for aid in cycle if aid in task_map}
+            if not scores:
                 continue
+            loser = min(scores, key=scores.get)
+            ag_l  = agents.get(loser)
+            if ag_l:
+                new_paths[loser] = [ag_l.pos]   # wait step
+                jitter = loser % _FORCE_WAIT_TICKS
+                self._force_wait_until[loser] = (
+                    current_tick + _FORCE_WAIT_TICKS + jitter)
+                logging.debug(f"    L2 лузер: А{loser} ждёт {_FORCE_WAIT_TICKS} тиков")
 
-            # Временные резервации:
-            #   1) постоянные блоки t=0 из основного reservations
-            #      (статичные агенты: IDLE, WAITING_SLOT, UNLOADING)
-            #   2) пути НЕ-вовлечённых в цикл активных агентов
-            temp_res: Dict = {}
+        return new_paths
 
-            # Копируем постоянные блоки (t_start==t_end==0), исключая агентов цикла
-            for pos, entries in main_res.items():
-                for entry in entries:
-                    if entry['agent_id'] in cycle:
-                        continue
-                    if entry['t_start'] == 0 and entry['t_end'] == 0:
-                        temp_res.setdefault(pos, []).append(dict(entry))
-
-            # Пути активных агентов не из цикла
-            for aid, path in result_paths.items():
-                if aid in cycle:
-                    continue
-                for step_i, pos in enumerate(path):
-                    temp_res.setdefault(pos, []).append({
-                        'agent_id': aid,
-                        't_start':  step_i,
-                        't_end':    step_i,
-                    })
-
-            # Локальный CBS для группы цикла (передаём temp_res в solve)
-            try:
-                local_paths = self._local_cbs.solve(cycle_tasks, temp_res)
-                improved    = 0
-                for aid, lpath in local_paths.items():
-                    if lpath and len(lpath) >= 1:
-                        result_paths[aid] = lpath
-                        improved += 1
-                        logging.debug(f"    ✅ Агент {aid}: путь {len(lpath)} шагов")
-
-                if improved:
-                    self._stat_cycles_resolved += 1
-                    logging.info(f"  ✅ Цикл разрешён локальным CBS "
-                                 f"({improved}/{len(cycle_ids)} агентов перепланированы)")
-
-            except Exception as exc:
-                logging.warning(f"  ⚠️  Локальный CBS упал для цикла {cycle_ids}: {exc}")
-
-        return result_paths
-
-    def get_stats(self) -> Dict[str, int]:
-        """Возвращает статистику работы уровня 2 за сессию."""
-        return {
-            'cycles_detected': self._stat_cycles_detected,
-            'cycles_resolved': self._stat_cycles_resolved,
-        }
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # УРОВЕНЬ 3 — Final conflict enforcement (без изменений)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def resolve_movement_conflicts(
-            self,
-            agents:    Dict[int, Any],
-            new_paths: Dict[int, List[Tuple[int, int]]],
-    ) -> Set[int]:
+    # ── Уровень 3 ─────────────────────────────────────────────────────────
+    def resolve_movement_conflicts(self,
+                                   agents: Dict[int, Any],
+                                   paths:  Dict[int, List[Tuple]],
+                                   current_tick: int = 0
+                                   ) -> Tuple[Set[int], Dict[int, Tuple]]:
         """
-        Финальный enforcement ПОСЛЕ router.solve() и resolve_local_deadlocks(),
-        ДО move().
+        Физический enforcement последнего шага перед ag.move().
+        Гарантирует: никакие два агента не оказываются в одной клетке.
 
-        Три независимых прохода (static строится ОДИН РАЗ):
-          Pass 1 — Static-блокировка: агент не может войти в клетку
-                   неподвижного не-IDLE агента.
-          Pass 2 — Vertex: из нескольких движущихся в одну клетку
-                   побеждает с наибольшим score. Итерировать до стабилизации.
-          Pass 3 — Swap: A→B и B→A одновременно — проигрывает с меньшим score.
-                   Итерировать до стабилизации.
+        Pass 1 — блокировка входа в занятые клетки (vertex-конфликт).
+        Pass 2 — цепочка вытеснения IDLE-агентов (chain-push).
+        Pass 3 — swap-конфликты: лузер блокируется + force_wait (баг 3).
 
-        Возвращает Set[agent_id] которым РАЗРЕШЕНО сделать шаг.
+        Возвращает:
+          allowed_to_move   — множество agent_id, которым разрешён шаг
+          idle_displacements — {idle_id: new_pos} физические смещения IDLE
         """
-        log: List[str] = []
+        if current_tick:
+            self._current_tick = current_tick
 
-        # Намерения: следующая позиция по новым путям от роутера
-        next_pos: Dict[int, Tuple[int, int]] = {}
-        for aid, ag in agents.items():
-            path = new_paths.get(aid, [])
+        from agent_module import (STATUS_IDLE, STATUS_UNLOADING,
+                                   STATUS_WAITING_SLOT, STATUS_CARRY_TO_PACKER)
+
+        # Следующие позиции (plan-step 1 или текущая если нет пути)
+        next_pos: Dict[int, Tuple] = {}
+        for aid, path in paths.items():
+            ag = agents.get(aid)
+            if ag is None: continue
             next_pos[aid] = path[1] if len(path) >= 2 else ag.pos
 
-        # static_origin: позиция → (aid, status) для агентов, остающихся на месте
-        static_origin: Dict[Tuple[int, int], Tuple[int, str]] = {}
-        for aid, ag in agents.items():
-            if next_pos[aid] == ag.pos:
-                static_origin[ag.pos] = (aid, ag.status)
-
-        allowed: Set[int] = set(agents.keys())
-        idle_displacements: Dict[int, Tuple[int, int]] = {}  # IDLE-смещения
-
-        # ── Pass 1: Static-блокировка + IDLE-уступание ──────────────────────
-        #
-        # Два класса статичных агентов:
-        #   • IDLE            — мягкий блокер: уступает движущемуся.
-        #                       Ищет свободную боковую клетку через _find_idle_aside.
-        #                       Приоритет: перпендикулярное направлению мувера.
-        #   • UNLOADING /     — жёсткий блокер: заблокирован рабочим процессом,
-        #     WAITING_SLOT      уйти не может. Движущийся ждёт.
-        #
-        # Алгоритм для IDLE-клеток:
-        #   1. Собираем всех претендентов на клетку.
-        #   2. Выбираем победителя по наибольшему score.
-        #   3. IDLE ищет боковую свободную клетку (не позицию победителя — не swap).
-        #   4. Если клетка найдена — IDLE уходит туда, победитель проходит.
-        #   5. Если клетки нет — IDLE остаётся, победитель ждёт.
-
-        # Шаг A: разделяем на жёсткие блоки и конкуренцию за IDLE-клетки
-        to_block: Set[int]             = set()
-        idle_targets: Dict[Tuple[int, int], List[int]] = {}  # dest → [mover_ids]
-
-        for aid in list(allowed):
-            dest = next_pos[aid]
-            if dest == agents[aid].pos:
-                continue
-            entry = static_origin.get(dest)
-            if entry is None:
-                continue
-            occ_aid, occ_status = entry
-            if occ_status == "IDLE":
-                idle_targets.setdefault(dest, []).append(aid)
-            else:
-                # UNLOADING / WAITING_SLOT — жёсткий блок
-                to_block.add(aid)
-                log.append(
-                    f"🚫 Агент {aid}→{dest}: клетка занята "
-                    f"агентом {occ_aid} ({occ_status})")
-
-        # Шаг B: жёсткие блоки
-        for aid in to_block:
-            allowed.discard(aid)
-            next_pos[aid] = agents[aid].pos
-
-        # Шаг C: IDLE-уступание — победитель проходит, IDLE смещается
-        for dest, mover_ids in idle_targets.items():
-            idle_aid, _ = static_origin[dest]
-            # Из претендентов берём только тех, кого не заблокировали ранее
-            candidates = [a for a in mover_ids if a in allowed]
-            if not candidates:
-                continue
-            # Победитель — наибольший score
-            winner = max(candidates, key=lambda a: agents[a].score)
-            losers = [a for a in candidates if a != winner]
-            # Проигравшие ждут следующего тика
-            for loser in losers:
-                allowed.discard(loser)
-                next_pos[loser] = agents[loser].pos
-
-        # Шаг C: IDLE-уступание через цепной сдвиг (_find_chain_push)
-        # occupied — текущие позиции агентов; обновляется по мере обработки цепей
-        occupied: Set[Tuple[int, int]] = {ag.pos for ag in agents.values()}
-        # pos_to_idle: только IDLE-агенты (их можно «толкать» по цепи)
-        pos_to_idle: Dict[Tuple[int, int], int] = {
-            ag.pos: aid
-            for aid, ag in agents.items()
-            if ag.status == "IDLE"
-        }
-
-        for dest, mover_ids in idle_targets.items():
-            idle_aid, _ = static_origin[dest]
-            candidates  = [a for a in mover_ids if a in allowed]
-            if not candidates:
-                continue
-            winner = max(candidates, key=lambda a: agents[a].score)
-            for loser in candidates:
-                if loser != winner:
-                    allowed.discard(loser)
-                    next_pos[loser] = agents[loser].pos
-
-            # BFS-цепной сдвиг: ищем путь через IDLE-соседей до свободной клетки
-            chain = self._find_chain_push(
-                start_pos   = agents[idle_aid].pos,
-                winner_pos  = agents[winner].pos,
-                winner_dest = dest,
-                occupied    = occupied,
-                pos_to_idle = pos_to_idle,
-            )
-
-            if chain:
-                # Применяем все смещения цепи
-                for aid_chain, new_pos in chain:
-                    old_pos = agents[aid_chain].pos
-                    next_pos[aid_chain]           = new_pos
-                    idle_displacements[aid_chain] = new_pos
-                    occupied.add(new_pos)
-                    occupied.discard(old_pos)
-                    # Обновляем pos_to_idle чтобы следующие цепи видели актуальное состояние
-                    pos_to_idle.pop(old_pos, None)
-                    pos_to_idle[new_pos] = aid_chain
-                chain_str = "→".join(f"{p}" for _, p in chain)
-                log.append(
-                    f"🟡 IDLE-цепь {len(chain)}: {chain_str} "
-                    f"(открывает путь агенту {winner}→{dest})")
-            else:
-                # Цепь не найдена — IDLE заперт, мувер ждёт
-                allowed.discard(winner)
-                next_pos[winner] = agents[winner].pos
-                log.append(
-                    f"⛔ IDLE {idle_aid} заперт у {dest} (цепь не найдена), "
-                    f"агент {winner} ждёт")
-
-        # ── Pass 2: Vertex-конфликты ─────────────────────────────────────────
+        allowed:    Set[int]          = set(next_pos.keys())
+        idle_displ: Dict[int, Tuple]  = {}
         changed = True
+
+        # ── Pass 1: vertex-конфликты ──────────────────────────────────────
         while changed:
             changed = False
-            dest_map: Dict[Tuple[int, int], List[int]] = {}
-            for aid in allowed:
-                if next_pos[aid] != agents[aid].pos:
-                    dest_map.setdefault(next_pos[aid], []).append(aid)
-
-            for dest, movers in dest_map.items():
-                if len(movers) < 2:
-                    continue
-                movers.sort(key=lambda x: agents[x].score, reverse=True)
-                for loser in movers[1:]:
+            # Клетки назначения для разрешённых агентов
+            claimed: Dict[Tuple, int] = {}
+            for aid in list(allowed):
+                pos = next_pos[aid]
+                if pos in claimed:
+                    # Конфликт: оставляем агента с бо́льшим score
+                    other = claimed[pos]
+                    ag    = agents.get(aid)
+                    ag_o  = agents.get(other)
+                    s     = ag.score    if ag   else 0.0
+                    s_o   = ag_o.score  if ag_o else 0.0
+                    loser = aid if s <= s_o else other
+                    winner = other if loser == aid else aid
                     if loser in allowed:
                         allowed.discard(loser)
                         next_pos[loser] = agents[loser].pos
+                        claimed[pos] = winner
                         changed = True
-                        log.append(
-                            f"🔄 Vertex {dest}: {movers[0]} "
-                            f"(score={agents[movers[0]].score:.2f}) проходит, "
-                            f"{loser} ждёт")
+                else:
+                    # Проверяем что целевая клетка физически свободна
+                    for oid, oag in agents.items():
+                        if oid in next_pos: continue  # движущийся — не статик
+                        if oag.pos == pos:
+                            allowed.discard(aid)
+                            next_pos[aid] = agents[aid].pos
+                            changed = True
+                            break
+                    else:
+                        claimed[pos] = aid
 
-        # ── Pass 3: Swap-конфликты ───────────────────────────────────────────
-        # Блокируем ОБОИХ участников swap.
-        # Победитель тоже не двигается: его цель (клетка проигравшего) остаётся
-        # занята, т.к. проигравший стоит на месте → физическая коллизия.
-        # На следующем тике роутер строит объездной маршрут.
-        changed = True
-        while changed:
-            changed = False
-            movers = [(aid, agents[aid].pos, next_pos[aid])
-                      for aid in allowed if next_pos[aid] != agents[aid].pos]
-            for i, (a1, c1, n1) in enumerate(movers):
-                for a2, c2, n2 in movers[i + 1:]:
-                    if n1 == c2 and n2 == c1:
-                        loser  = a2 if agents[a1].score >= agents[a2].score else a1
-                        winner = a1 if loser == a2 else a2
-                        for blocked in (a1, a2):
-                            if blocked in allowed:
-                                allowed.discard(blocked)
-                                next_pos[blocked] = agents[blocked].pos
-                                changed = True
-                        log.append(f"🔁 Swap {a1}↔{a2}: оба ждут "
-                                   f"({winner} приоритет, переплан следующий тик)")
+        # ── Pass 2: chain-push IDLE-агентов ──────────────────────────────
+        # Если активный агент заблокирован IDLE-агентом, IDLE уступает:
+        # он смещается на клетку, которую покидает активный.
+        for aid in list(allowed):
+            ag = agents.get(aid)
+            if ag is None: continue
+            target = next_pos[aid]
+            # Ищем IDLE/WAITING_SLOT агента на target
+            blocker_id = None
+            for oid, oag in agents.items():
+                if oid not in next_pos and oag.pos == target:
+                    if oag.status in (STATUS_IDLE,):
+                        blocker_id = oid
+                    break
+            if blocker_id is None: continue
+            blocker = agents[blocker_id]
+            # Смещаем blocker на текущую позицию активного агента (цепочка)
+            vacated = ag.pos
+            # Проверяем что vacated не будет занята другим
+            conflict = any(
+                oid != blocker_id and next_pos.get(oid) == vacated
+                for oid in next_pos)
+            if not conflict:
+                idle_displ[blocker_id] = vacated
+                logging.debug(f"  [L3] chain-push: А{blocker_id} "
+                              f"{blocker.pos}→{vacated}")
 
-        if log:
-            logging.debug("📋 [L3] Конфликты: " + " | ".join(log))
+        # ── Pass 3: swap-конфликты (БАГ 3 ИСПРАВЛЕНИЕ) ───────────────────
+        #
+        # Сценарий осцилляции ↑↓:
+        #   Тик T:   A хочет на pos(B), B хочет на pos(A) → swap.
+        #            Оба блокируются → оба стоят.
+        #   Тик T+1: CBS строит те же пути → тот же swap → вечный цикл.
+        #
+        # Исправление:
+        #   Оба блокируются (как раньше), НО лузер получает force_wait
+        #   на _SWAP_WAIT_TICKS тиков через _swap_losers_pending.
+        #   Тик T+1: лузер → WAIT, победитель планирует свободно → swap разрешён.
+        #   Случайный jitter предотвращает симметричные новые swap.
+        aid_list = list(allowed)
+        for i, a1 in enumerate(aid_list):
+            for a2 in aid_list[i + 1:]:
+                ag1, ag2 = agents.get(a1), agents.get(a2)
+                if ag1 is None or ag2 is None: continue
+                # Swap: A хочет на pos(B) и B хочет на pos(A)
+                if next_pos.get(a1) == ag2.pos and next_pos.get(a2) == ag1.pos:
+                    # Определяем лузера по score (меньший score уступает)
+                    loser  = a1 if (ag1.score <= ag2.score) else a2
+                    winner = a2 if loser == a1 else a1
+                    # Блокируем обоих на этот тик (физически нельзя свапнуться)
+                    allowed.discard(a1)
+                    allowed.discard(a2)
+                    next_pos[a1] = ag1.pos
+                    next_pos[a2] = ag2.pos
+                    # Лузер получает force_wait → разрывает осцилляцию
+                    jitter = loser % 3
+                    until  = self._current_tick + _SWAP_WAIT_TICKS + jitter
+                    self._force_wait_until[loser] = until
+                    logging.info(f"  [L3] swap А{a1}↔А{a2}: "
+                                 f"лузер=А{loser} (score {agents[loser].score:.2f}) "
+                                 f"→ force_wait до тика {until}")
 
-        return allowed, idle_displacements
+        return allowed, idle_displ

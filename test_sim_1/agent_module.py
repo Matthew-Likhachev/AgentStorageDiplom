@@ -10,7 +10,14 @@ Centralized Orchestration + Intelligent Priority Score
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
+
+# Синхронизировано с router_interface._PERM.
+# Статичные агенты (IDLE / WAITING_SLOT / UNLOADING) и занятые слоты
+# бронируются с t_end=_PERM — блокируют на всех t≥0.
+# Движущиеся агенты бронируются с t_end=0 — блокируют только в t=0;
+# CBS / LNS могут прокладывать пути через их позиции в t≥1.
+_PERM: int = 99_999
 
 try:
     from router_interface import IRouter, BaseGridRouter
@@ -215,6 +222,7 @@ class PackerSlotManager:
           {pos: [{'agent_id': owner_id, 't_start': 0, 't_end': 0}]}
         Это означает: позиция слота постоянно занята для всех КРОМЕ owner_id.
         Передаётся роутеру — A* не прокладывает пути других агентов через эти клетки.
+        t_end=_PERM → CBS/_is_blocked трактует как постоянную бронь на всех t≥0.
         """
         res: Dict = {}
         for pid, slot_dict in self.slots.items():
@@ -222,7 +230,7 @@ class PackerSlotManager:
                 owner = self.slot_owners.get(pid, {}).get(sn)
                 if owner is not None:
                     res.setdefault(pos, []).append(
-                        {'agent_id': owner, 't_start': 0, 't_end': 0})
+                        {'agent_id': owner, 't_start': 0, 't_end': _PERM})
         return res
 
 
@@ -548,84 +556,76 @@ class AgentManager:
 
     def print_order_summary(self):
         """
-        Выводит в консоль текущее состояние заказов и назначений.
-        Формат: Заказ → Подзаказы → Агенты.
-        Дополнительно: разбивка IDLE/ожидающих агентов для диагностики freeze.
+        Выводит в консоль текущее состояние заказов и детальную таблицу агентов.
+        БАГ 5: добавлена построчная таблица каждого агента (позиция, цель,
+        статус, наличие груза, длина пути, score, слот) для диагностики.
         """
         if not self.dispatcher:
             return
-        print("\n" + "═"*60)
+        print("\n" + "═"*70)
         print(f"  📋 ЗАКАЗЫ — тик {self.current_tick}")
-        print("═"*60)
+        print("═"*70)
 
-        # Карта: suborder_id → список агентов
         sub_agents: Dict[int, List[int]] = {}
         for ag in self.agents.values():
             if ag.current_suborder is not None:
-                sid = ag.current_suborder.suborder_id
-                sub_agents.setdefault(sid, []).append(ag.id)
-
-        # Карта: статус → список агентов (для диагностики)
-        status_groups: Dict[str, List[int]] = {}
-        for ag in self.agents.values():
-            status_groups.setdefault(ag.status, []).append(ag.id)
+                sub_agents.setdefault(ag.current_suborder.suborder_id, []).append(ag.id)
 
         for pid in self.dispatcher.packer_ids:
             act_oid = self.dispatcher.active_order_id.get(pid)
             act_sid = self.dispatcher.active_suborder_id.get(pid)
             print(f"\n  Фасовщик {pid}:")
-
             if act_oid is None:
-                print("    — нет активного заказа")
-                continue
-
+                print("    — нет активного заказа"); continue
             order = self.dispatcher.orders.get(act_oid)
-            if order is None:
-                continue
-
+            if order is None: continue
             print(f"    Заказ #{act_oid}  ({len(order.suborders)} подзаказов)")
-
             for sub in order.suborders:
-                sid   = sub.suborder_id
-                st    = sub.status.value
-                agents = sub_agents.get(sid, [])
-                is_act = "◀ АКТИВНЫЙ" if sid == act_sid else ""
+                sid       = sub.suborder_id
+                st        = sub.status.value
+                agents    = sub_agents.get(sid, [])
+                is_act    = "◀ АКТИВНЫЙ" if sid == act_sid else ""
                 pending_n = len(sub.pending_shelves)
                 total_n   = len(sub.required_shelves)
-
-                agents_str = (", ".join(f"А{a}" for a in sorted(agents))
-                              if agents else "—")
-
-                # Показываем стеллажи с аборт-предупреждениями
-                stuck_shelves = [
-                    f"{pos}×{cnt}"
-                    for pos, cnt in self._shelf_abort_count.items()
-                    if pos in sub.pending_shelves and cnt > 0]
-                stuck_str = f"  ⚠️abort:{','.join(stuck_shelves)}" if stuck_shelves else ""
-
-                print(f"      Подзаказ #{sid:3d}  [{st:13s}]  "
+                agents_str = (", ".join(f"А{a}" for a in sorted(agents)) or "—")
+                stuck_shelves = [f"{pos}×{cnt}"
+                                 for pos, cnt in self._shelf_abort_count.items()
+                                 if pos in sub.pending_shelves and cnt > 0
+                                 and not str(pos).startswith('ret_')]
+                stuck_str = f"  ⚠️{','.join(stuck_shelves)}" if stuck_shelves else ""
+                print(f"      #{sid:3d}  [{st:13s}]  "
                       f"{total_n}п({pending_n}ждут/{sub.active_agents}в пути)  "
                       f"агенты: {agents_str}  {is_act}{stuck_str}")
 
-        # ── Диагностика: статусы всех агентов ────────────────────────────
-        idle_ids = sorted(status_groups.get(STATUS_IDLE, []))
-        wait_ids = sorted(status_groups.get(STATUS_WAITING_SLOT, []))
-        go_ids   = sorted(status_groups.get(STATUS_GO_TO_SHELF, []))
-        carry_ids= sorted(status_groups.get(STATUS_CARRY_TO_PACKER, []))
-        ret_ids  = sorted(status_groups.get(STATUS_RETURN_SHELF, []))
-        unl_ids  = sorted(status_groups.get(STATUS_UNLOADING, []))
+        # ── Детальная таблица агентов (БАГ 5) ────────────────────────────
+        STATUS_SHORT = {
+            STATUS_IDLE:            "IDLE        ",
+            STATUS_GO_TO_SHELF:     "GO_SHELF    ",
+            STATUS_CARRY_TO_PACKER: "CARRY_PACK  ",
+            STATUS_WAITING_SLOT:    "WAIT_SLOT   ",
+            STATUS_UNLOADING:       "UNLOADING   ",
+            STATUS_RETURN_SHELF:    "RETURN_SHELF",
+        }
+        print(f"\n  {'А':>3}  {'Статус':<14} {'Позиция':<10} {'Цель':<10} "
+              f"{'Груз':<5} {'Путь':>5} {'Score':>6} {'Слот':>5}")
+        print("  " + "─"*62)
+        for aid in sorted(self.agents):
+            ag       = self.agents[aid]
+            st_str   = STATUS_SHORT.get(ag.status, ag.status[:12])
+            pos_str  = str(ag.pos)
+            goal_str = str(ag.goal) if ag.goal else "—"
+            cargo    = "✓" if ag.has_cargo else "—"
+            path_len = len(ag.path) - ag.current_path_index if ag.path else 0
+            slot_str = str(ag.assigned_slot_num) if ag.assigned_slot_num else "—"
+            print(f"  {aid:>3}  {st_str:<14} {pos_str:<10} {goal_str:<10} "
+                  f"{cargo:<5} {path_len:>5} {ag.score:>6.2f} {slot_str:>5}")
 
-        parts = []
-        if idle_ids:  parts.append(f"IDLE:{','.join(f'А{i}' for i in idle_ids)}")
-        if go_ids:    parts.append(f"GO:{','.join(f'А{i}' for i in go_ids)}")
-        if carry_ids: parts.append(f"CARRY:{','.join(f'А{i}' for i in carry_ids)}")
-        if unl_ids:   parts.append(f"UNLOAD:{','.join(f'А{i}' for i in unl_ids)}")
-        if wait_ids:  parts.append(f"WAIT_SLOT:{','.join(f'А{i}' for i in wait_ids)}")
-        if ret_ids:   parts.append(f"RETURN:{','.join(f'А{i}' for i in ret_ids)}")
-        if parts:
-            print(f"\n  🤖 Агенты: {' | '.join(parts)}")
-
-        print("═"*60 + "\n")
+        # ── Сводка по статусам ────────────────────────────────────────────
+        from collections import Counter
+        st_cnt = Counter(ag.status for ag in self.agents.values())
+        parts  = [f"{k}:{v}" for k, v in sorted(st_cnt.items())]
+        print(f"\n  🤖 Итого: {' | '.join(parts)}")
+        print("═"*70 + "\n")
 
     def _assign_agent_to_shelf(self, ag: 'Agent', pid: int, sub, shelf_pos, pre_slot):
         """Вспомогательный: устанавливает агенту задачу GO_TO_SHELF."""
@@ -667,6 +667,27 @@ class AgentManager:
             return sp
         return None
 
+    def _try_unblock_cargo_agent(self, ag: 'Agent'):
+        """
+        Вспомогательный для баг 6: ищет IDLE-агентов вблизи застрявшего
+        RETURN_SHELF агента и сбрасывает их waiting_time, чтобы Level-3
+        (resolve_movement_conflicts chain-push) вытолкнул их с дороги.
+        """
+        if not ag.original_shelf_pos:
+            return
+        nearby = [
+            other for other in self.agents.values()
+            if other.id != ag.id
+            and other.status == STATUS_IDLE
+            and (abs(other.pos[0] - ag.pos[0]) +
+                 abs(other.pos[1] - ag.pos[1])) <= 4
+        ]
+        if nearby:
+            logging.info(f"  🔓 А{ag.id}: будим {len(nearby)} IDLE-агентов "
+                         f"поблизости для освобождения пути к {ag.original_shelf_pos}")
+            for other in nearby:
+                other.waiting_time = 0   # сбросить → Level-3 даст им уступку
+
     # ── основной тик ─────────────────────────────────────────────────────────
     def run_tick(self) -> Dict[str, Any]:
         self.current_tick += 1
@@ -678,10 +699,22 @@ class AgentManager:
         # (их пути добавятся через _reserve после solve).
         reservations = self.reservations
         reservations.clear()
+
+        # БАГ 2 ИСПРАВЛЕНИЕ: разделяем статичных и движущихся агентов.
+        #
+        # Статичные (IDLE / UNLOADING / WAITING_SLOT) → t_end=_PERM:
+        #   _is_blocked возвращает True для любого t≥0.
+        #   CBS / LNS не прокладывает пути через их позиции.
+        #
+        # Движущиеся (GO_TO_SHELF / CARRY_TO_PACKER / RETURN_SHELF) → t_end=0:
+        #   _is_blocked возвращает True ТОЛЬКО при t==0.
+        #   CBS / LNS может прокладывать пути через их позиции в t≥1
+        #   (агент успеет уйти); это устраняет лишние wait-шаги в плане.
         _static_statuses = (STATUS_IDLE, STATUS_UNLOADING, STATUS_WAITING_SLOT)
         for _ag in self.agents.values():
+            _t_end = _PERM if (_ag.status in _static_statuses or _ag.goal is None) else 0
             reservations.setdefault(_ag.pos, []).append(
-                {'agent_id': _ag.id, 't_start': 0, 't_end': 0})
+                {'agent_id': _ag.id, 't_start': 0, 't_end': _t_end})
 
         # Эксклюзивные резервации слотов: каждый занятый слот — постоянный блок
         # для всех КРОМЕ владельца. Роутер не прокладывает чужие пути через них.
@@ -1019,31 +1052,59 @@ class AgentManager:
                     self._abort_go_to_shelf(ag)
                 continue
 
-            # RETURN_SHELF + REPLAN = агент застрял возвращая стеллаж.
-            # Принудительно завершаем возврат: стеллаж → ACTIVE, агент → IDLE.
-            # Без этого active_agents никогда не обнулится → подзаказ вечно COMPLETING.
+            # RETURN_SHELF + REPLAN = агент застрял при возврате стеллажа.
+            #
+            # БАГ 6 ИСПРАВЛЕНИЕ: агент НЕ ИМЕЕТ ПРАВА бросить груз не на полке.
+            # Прежний код принудительно завершал возврат → груз «испарялся» в
+            # середине склада, active_agents обнулялся фиктивно.
+            #
+            # Новое поведение:
+            #   • Агент ещё не дошёл до полки → сбрасываем путь, сбрасываем
+            #     stuck-счётчик, роутер найдёт новый маршрут в следующем тике.
+            #     Уровень-3 (resolve_movement_conflicts) вытолкнет IDLE-агентов
+            #     с дороги через механизм chain-push.
+            #   • После _MAX_RETURN_STUCK попыток → эскалация: ищем и выдворяем
+            #     IDLE-агентов поблизости принудительно.
+            #   • Принудительное завершение возврата ТОЛЬКО если агент уже
+            #     физически стоит на целевой полке (pos == original_shelf_pos).
             if ag.status == STATUS_RETURN_SHELF and actions.get(ag.id) == 'REPLAN':
-                logging.warning(f"  ⚠️ Агент {ag.id}: RETURN_SHELF застрял → принудительное завершение")
-                if ag.original_shelf_pos:
-                    self.shelf_states[ag.original_shelf_pos] = 'ACTIVE'
-                    self._shelf_cooldown[ag.original_shelf_pos] = (
-                        self.current_tick + self._SHELF_COOLDOWN_TICKS)
-                # Освобождаем слот явно (иначе slot_owners остаётся с ID агента)
-                if ag.current_suborder and ag.assigned_slot_num is not None:
-                    self.slot_manager.release_slot(
-                        ag.current_suborder.packer_id, ag.assigned_slot_num)
-                if self.dispatcher and ag.current_suborder:
-                    self.dispatcher.complete_agent_in_suborder(
-                        ag.current_suborder.suborder_id)
-                ag.status             = STATUS_IDLE
-                ag.goal               = None
-                ag.current_suborder   = None
-                ag.has_cargo          = False
-                ag.original_shelf_pos = None
-                ag.assigned_slot_num  = None
-                ag.shortest_path_len  = 0
-                ag.path               = []
-                continue
+                if ag.pos != ag.original_shelf_pos:
+                    # ── Агент с грузом, но ещё не на полке ──────────────────
+                    _rkey = f'ret_{ag.id}'
+                    _cnt  = self._shelf_abort_count.get(_rkey, 0) + 1
+                    self._shelf_abort_count[_rkey] = _cnt
+                    _MAX  = 15
+
+                    if _cnt < _MAX:
+                        logging.warning(
+                            f"  ⚠️ А{ag.id}: RETURN_SHELF заблокирован "
+                            f"(попытка {_cnt}/{_MAX}). "
+                            f"Груз СОХРАНЯЕТСЯ, ищем новый путь "
+                            f"{ag.pos}→{ag.original_shelf_pos}.")
+                    else:
+                        logging.error(
+                            f"  🚨 А{ag.id}: RETURN_SHELF критически заблокирован "
+                            f"({_cnt} попыток). Груз СОХРАНЯЕТСЯ. "
+                            f"Выдворяем IDLE-агентов поблизости.")
+                        self._try_unblock_cargo_agent(ag)
+                        self._shelf_abort_count[_rkey] = _MAX  # не переполняем лог
+
+                    # Сброс пути и stuck-счётчика → новый маршрут в следующем тике
+                    ag.path               = []
+                    ag.current_path_index = 0
+                    ag.shortest_path_len  = 0
+                    self.deadlock_resolver.stuck_since[ag.id] = self.current_tick
+                    # Инвалидируем кэш плана (маршрут изменится)
+                    if hasattr(self.router, 'invalidate_plan'):
+                        self.router.invalidate_plan()
+                    continue   # остаёмся RETURN_SHELF, tasks не добавляем
+
+                else:
+                    # Агент УЖЕ на полке, но DeadlockResolver выдал REPLAN.
+                    # Шаг 3 уже обработал или обработает завершение через
+                    # (ag.pos == ag.goal), поэтому просто пропускаем добавление в tasks.
+                    self._shelf_abort_count.pop(f'ret_{ag.id}', None)
+                    continue
 
             returning_shelf = (ag.status == STATUS_RETURN_SHELF)
             if ag.shortest_path_len == 0 and hasattr(self.router, 'path_length'):
@@ -1065,12 +1126,23 @@ class AgentManager:
         paths = self.router.solve(tasks, reservations)
 
         # 6_L2. WFG-обнаружение циклов + локальный CBS (Уровень 2).
-        # Запускается ПОСЛЕ router.solve() и ДО записи путей в агентов.
-        # Перепланирует только агентов, попавших в циклический дедлок,
-        # оставляя пути остальных нетронутыми.
-        paths = self.deadlock_resolver.resolve_local_deadlocks(
-            self.agents, paths, tasks, self.current_tick,
-            reservations=reservations)
+        #
+        # БАГ 4 ПОЯСНЕНИЕ: для централизованных алгоритмов (CBS / LNS)
+        # WFG не нужен никогда:
+        #   • CBS / LNS строят глобально бесконфликтный план → циклических
+        #     дедлоков в плане нет по определению.
+        #   • RouterContext кэширует план и переиспользует его. При любом
+        #     отклонении (REPLAN, смена цели) — полный пересчёт, после которого
+        #     план снова бесконфликтен.
+        #   • WFG нужен только для реактивного A* (is_centralized=False),
+        #     где каждый агент строит путь независимо и может попасть в цикл.
+        #
+        # Вызываем WFG только для реактивного A*:
+        if not self.router.is_centralized:
+            paths = self.deadlock_resolver.resolve_local_deadlocks(
+                self.agents, paths, tasks, self.current_tick,
+                reservations=reservations)
+        # Для CBS / LNS: пропускаем WFG, план уже бесконфликтен.
 
         # 6a. Записываем пути (ещё не двигаемся)
         for aid, path in paths.items():
@@ -1083,11 +1155,8 @@ class AgentManager:
             ag.current_path_index = 1  # path[0]=cur pos, path[1]=next step
 
         # 6b. Финальный enforcement: vertex + swap + IDLE-уступка.
-        # Возвращает (allowed_to_move, idle_displacements):
-        #   allowed_to_move   — агенты с путями, которым разрешён шаг
-        #   idle_displacements — {idle_id: new_pos} физические смещения IDLE
         allowed_to_move, idle_displacements = self.deadlock_resolver.resolve_movement_conflicts(
-            self.agents, paths)
+            self.agents, paths, self.current_tick)
 
         # 6c. move() только для разрешённых активных агентов (есть путь от роутера)
         for aid, path in paths.items():
