@@ -18,6 +18,11 @@ from typing import Dict, List, Optional, Tuple, Any, Set
 # Движущиеся агенты бронируются с t_end=0 — блокируют только в t=0;
 # CBS / LNS могут прокладывать пути через их позиции в t≥1.
 _PERM: int = 99_999
+# Импортируем _IDLE_PERM: cargo-агенты не блокируются IDLE позициями в A*
+try:
+    from router_interface import _IDLE_PERM
+except ImportError:
+    _IDLE_PERM: int = 99_998
 
 try:
     from router_interface import IRouter, BaseGridRouter
@@ -263,6 +268,10 @@ class AgentManager:
         # чтобы не зациклить систему в бесконечных retry.
         self._shelf_abort_count: Dict[Tuple[int, int], int] = {}
         self._SHELF_MAX_ABORTS  = 5  # попыток перед признанием недостижимым
+
+        # Счётчик consecutive "нет пути" и stuck-counter для диагностики
+        self._no_path_count:  Dict[int, int] = {}
+        self._last_move_tick: Dict[int, int] = {}
         for row in map_data.get('cells', []):
             for c in row:
                 if c['type'] == 'S':
@@ -544,6 +553,9 @@ class AgentManager:
         if pid and ag.assigned_slot_num:
             self.slot_manager.release_slot(pid, ag.assigned_slot_num)
 
+        if hasattr(self.router, 'invalidate_plan'):
+            self.router.invalidate_plan(ag.id)
+
         ag.status             = STATUS_IDLE
         ag.goal               = None
         ag.current_suborder   = None
@@ -607,8 +619,12 @@ class AgentManager:
             STATUS_RETURN_SHELF:    "RETURN_SHELF",
         }
         print(f"\n  {'А':>3}  {'Статус':<14} {'Позиция':<10} {'Цель':<10} "
-              f"{'Груз':<5} {'Путь':>5} {'Score':>6} {'Слот':>5}")
-        print("  " + "─"*62)
+              f"{'Груз':<5} {'Путь':>5} {'Score':>6} {'Слот':>5} {'Кэш':<7} {'Стк':>4} {'НП':>4}")
+        print("  " + "─"*82)
+        cached_paths  = getattr(self.router, '_cached_paths', {})
+        stuck_since   = getattr(self.deadlock_resolver, 'stuck_since', {})
+        stuck_agents  = []   # для блока диагностики
+
         for aid in sorted(self.agents):
             ag       = self.agents[aid]
             st_str   = STATUS_SHORT.get(ag.status, ag.status[:12])
@@ -617,14 +633,41 @@ class AgentManager:
             cargo    = "✓" if ag.has_cargo else "—"
             path_len = len(ag.path) - ag.current_path_index if ag.path else 0
             slot_str = str(ag.assigned_slot_num) if ag.assigned_slot_num else "—"
+            c        = cached_paths.get(aid)
+            cache_str = f"{len(c)}шг" if c else "нет"
+
+            # Стк = тиков без движения (из DeadlockResolver)
+            stuck_t  = self.current_tick - stuck_since.get(aid, self.current_tick)
+            stk_str  = f"⚠{stuck_t}" if stuck_t >= 5 and ag.goal else (
+                       str(stuck_t)   if stuck_t > 0 and ag.goal else "—")
+
+            # НП = consecutive "нет пути" (из _no_path_count)
+            no_path  = self._no_path_count.get(aid, 0)
+            np_str   = f"⚠{no_path}" if no_path >= 3 else (str(no_path) if no_path else "—")
+
+            if (stuck_t >= 5 or no_path >= 3) and ag.goal:
+                stuck_agents.append((aid, ag, stuck_t, no_path))
+
             print(f"  {aid:>3}  {st_str:<14} {pos_str:<10} {goal_str:<10} "
-                  f"{cargo:<5} {path_len:>5} {ag.score:>6.2f} {slot_str:>5}")
+                  f"{cargo:<5} {path_len:>5} {ag.score:>6.2f} {slot_str:>5} "
+                  f"{cache_str:<7} {stk_str:>4} {np_str:>4}")
 
         # ── Сводка по статусам ────────────────────────────────────────────
         from collections import Counter
         st_cnt = Counter(ag.status for ag in self.agents.values())
         parts  = [f"{k}:{v}" for k, v in sorted(st_cnt.items())]
         print(f"\n  🤖 Итого: {' | '.join(parts)}")
+
+        # ── Диагностика застрявших агентов ────────────────────────────────
+        if stuck_agents:
+            print(f"\n  ⚠️  ПРОБЛЕМНЫЕ АГЕНТЫ:")
+            for aid, ag, stuck_t, no_path in stuck_agents:
+                diag = self._diagnose_stuck_agent(ag)
+                print(f"    А{aid} [{ag.status}] @ {ag.pos} → {ag.goal} "
+                      f"cargo={ag.has_cargo} stuck={stuck_t}т НП={no_path}")
+                for line in diag:
+                    print(f"      {line}")
+
         print("═"*70 + "\n")
 
     def _assign_agent_to_shelf(self, ag: 'Agent', pid: int, sub, shelf_pos, pre_slot):
@@ -640,6 +683,9 @@ class AgentManager:
         ag.shortest_path_len  = 0
         ag.waiting_time       = 0
         ag.urgency            = max(1, min(10, 11 - pre_slot[0]))
+        # Сбрасываем кэш пути: новое задание → новый маршрут
+        if hasattr(self.router, 'invalidate_plan'):
+            self.router.invalidate_plan(ag.id)
         logging.info(f"  🚀 Агент {ag.id} → подзаказ #{sub.suborder_id} "
                      f"стеллаж {shelf_pos} [слот {pre_slot[0]}]")
 
@@ -688,31 +734,97 @@ class AgentManager:
             for other in nearby:
                 other.waiting_time = 0   # сбросить → Level-3 даст им уступку
 
+    def _diagnose_stuck_agent(self, ag: 'Agent') -> List[str]:
+        """
+        Диагностика застрявшего агента: показывает соседние клетки,
+        почему они недостижимы (карта / брони / агенты).
+        """
+        lines = []
+        pos  = ag.pos
+        goal = ag.goal
+        rs   = (ag.status == STATUS_RETURN_SHELF)
+
+        # Направления ячейки
+        dirs_l = getattr(self.router._algorithm, 'dirs_loaded', {}).get(pos, set())
+        dirs_e = getattr(self.router._algorithm, 'dirs_empty',  {}).get(pos, set())
+        c_type = getattr(self.router._algorithm, 'cell_types',  {}).get(pos, '?')
+        lines.append(f"тип='{c_type}' dirs_loaded={sorted(dirs_l)} "
+                     f"dirs_empty={sorted(dirs_e)}")
+
+        # Соседние клетки
+        DIR_OFFSETS = {'n': (-1,0), 's': (1,0), 'w': (0,-1), 'e': (0,1)}
+        algo = getattr(self.router, '_algorithm', None)
+        for d, (dr, dc) in DIR_OFFSETS.items():
+            nb = (pos[0]+dr, pos[1]+dc)
+            reasons = []
+
+            # Карта: физический барьер?
+            if algo:
+                if not algo._is_valid(nb):
+                    reasons.append("стена/граница")
+                elif not algo._can_move(pos, nb, ag.has_cargo, rs):
+                    nb_type = algo.cell_types.get(nb, '?')
+                    reasons.append(f"запрет направления (→'{nb_type}')")
+                else:
+                    # Брони
+                    blocked_by = []
+                    for b in self.reservations.get(nb, []):
+                        if b['agent_id'] == ag.id: continue
+                        who = self.agents.get(b['agent_id'])
+                        who_str = f"А{b['agent_id']}" + (
+                            f"@{who.pos}" if who else "")
+                        blocked_by.append(f"{who_str}(t_end={b['t_end']})")
+                    if blocked_by:
+                        reasons.append(f"занято: {', '.join(blocked_by)}")
+                    else:
+                        reasons.append("СВОБОДНО ✓")
+            else:
+                reasons.append("нет алгоритма")
+
+            status = reasons[0] if reasons else "?"
+            lines.append(f"  [{d}] {nb}: {status}")
+
+        if goal:
+            gr, gc = goal
+            pr, pc = pos
+            lines.append(f"  Дистанция до цели: {abs(gr-pr)+abs(gc-pc)} клеток")
+
+        return lines
+
     # ── основной тик ─────────────────────────────────────────────────────────
     def run_tick(self) -> Dict[str, Any]:
         self.current_tick += 1
 
         # Заполняем reservations перед планированием.
-        # Статичные агенты (IDLE/UNLOADING/WAITING_SLOT или без цели) —
-        # t_start=t_end=0 → _is_blocked интерпретирует как постоянную блокировку
-        # на всех временны́х шагах. Движущиеся агенты резервируются только на t=0
-        # (их пути добавятся через _reserve после solve).
+        #
+        # Классификация агентов по типу блокировки:
+        #
+        # t_end=_PERM — «жёсткий» блок (физически зафиксирован):
+        #   WAITING_SLOT — стоит в конвойном слоте, уступить не может
+        #   UNLOADING    — идёт разгрузка, уходить нельзя
+        #
+        # t_end=0 — «мягкий» блок (может уступить):
+        #   IDLE         — свободный агент, может быть вытолкан Level-3 chain push
+        #   Движущиеся   — уйдут сами в следующем тике; A*/CBS планирует через них
+        #
+        # ПОЧЕМУ IDLE МЯГКИЙ (исправление):
+        #   Ранее IDLE = _PERM → A* видел стены там, где агенты могут уступить.
+        #   Это вызывало "нет пути" когда IDLE агент сидел на целевой ячейке или
+        #   в единственном коридоре. Теперь A* планирует ЧЕРЕЗ IDLE позиции (t≥1),
+        #   а Level-3 chain push физически сдвигает IDLE агента при необходимости.
+        #   CARGO агенты → планируются первыми (см. PrioritizedAStarSolver),
+        #   резервируют пути → no-cargo агенты огибают → cargo получает приоритет.
         reservations = self.reservations
         reservations.clear()
 
-        # БАГ 2 ИСПРАВЛЕНИЕ: разделяем статичных и движущихся агентов.
-        #
-        # Статичные (IDLE / UNLOADING / WAITING_SLOT) → t_end=_PERM:
-        #   _is_blocked возвращает True для любого t≥0.
-        #   CBS / LNS не прокладывает пути через их позиции.
-        #
-        # Движущиеся (GO_TO_SHELF / CARRY_TO_PACKER / RETURN_SHELF) → t_end=0:
-        #   _is_blocked возвращает True ТОЛЬКО при t==0.
-        #   CBS / LNS может прокладывать пути через их позиции в t≥1
-        #   (агент успеет уйти); это устраняет лишние wait-шаги в плане.
-        _static_statuses = (STATUS_IDLE, STATUS_UNLOADING, STATUS_WAITING_SLOT)
+        _hard_statuses = (STATUS_UNLOADING, STATUS_WAITING_SLOT)
         for _ag in self.agents.values():
-            _t_end = _PERM if (_ag.status in _static_statuses or _ag.goal is None) else 0
+            if _ag.status in _hard_statuses:
+                _t_end = _PERM         # жёсткий блок: WAITING_SLOT / UNLOADING
+            elif _ag.status == STATUS_IDLE or _ag.goal is None:
+                _t_end = _IDLE_PERM   # IDLE: блокирует no-cargo, не блокирует cargo
+            else:
+                _t_end = 0            # движущийся агент: блок только в t=0
             reservations.setdefault(_ag.pos, []).append(
                 {'agent_id': _ag.id, 't_start': 0, 't_end': _t_end})
 
@@ -801,6 +913,31 @@ class AgentManager:
         #
         if self.dispatcher:
             from dispatcher import SubOrderStatus as _SOS
+
+            # ── 2.0 Переназначение CARRY_TO_PACKER без цели ──────────────────
+            # Когда AgentManager обнаружил что слот физически недостижим
+            # (шаг 5 REPLAN-эскалация сбросил ag.goal=None но оставил has_cargo),
+            # пробуем занять последний (входной) слот конвоя.
+            # После освобождения старого слота конвой _advance_convoy продвинется
+            # и откроет входной слот 10 → агент получит к нему доступ.
+            for ag in list(self.agents.values()):
+                if ag.status != STATUS_CARRY_TO_PACKER: continue
+                if ag.goal is not None: continue    # уже есть цель
+                if not ag.has_cargo:    continue    # не с грузом
+                pid = ag.current_suborder.packer_id if ag.current_suborder else None
+                if pid is None: continue
+                _sub_id = ag.current_suborder.suborder_id if ag.current_suborder else None
+                new_slot = self.slot_manager.acquire_last_slot(pid, ag.id, _sub_id)
+                if new_slot:
+                    ag.assigned_slot_num = new_slot[0]
+                    ag.goal              = new_slot[1]
+                    ag.urgency           = max(1, min(10, 11 - new_slot[0]))
+                    ag.shortest_path_len = 0
+                    if hasattr(self.router, 'invalidate_plan'):
+                        self.router.invalidate_plan(ag.id)
+                    logging.info(f"  🔄 А{ag.id}: повторно назначен на слот "
+                                 f"{new_slot[0]} @ {new_slot[1]} (предыдущий был недостижим)")
+
             free_agents = sorted(
                 [a for a in self.agents.values()
                  if a.status == STATUS_IDLE and not a.path],
@@ -1043,14 +1180,52 @@ class AgentManager:
 
             # GO_TO_SHELF + REPLAN = агент застрял.
             if ag.status == STATUS_GO_TO_SHELF and actions.get(ag.id) == 'REPLAN':
-                # Сначала проверяем: стоит ли другой агент на целевой полке?
-                # Агент без груза может находиться на стеллаже — он и блокирует путь.
-                # В этом случае назначаем блокирующего агента перевозчиком этой полки.
                 hijacked = self._try_hijack_blocker(ag)
                 if not hijacked:
                     logging.warning(f"  ⚠️ Агент {ag.id}: GO_TO_SHELF застрял → abort")
                     self._abort_go_to_shelf(ag)
                 continue
+
+            # CARRY_TO_PACKER + REPLAN = агент с грузом не может добраться до слота.
+            #
+            # ТИПИЧНАЯ ПРИЧИНА: слот N назначен, но физически доступен только через
+            # слот N+1 и N+2 (конвойный коридор входит с дальнего конца). Эти слоты
+            # заняты WAITING_SLOT агентами (_PERM блок) → A* не находит путь.
+            # При этом slot_owners[N] = А{id} → _advance_convoy не может продвинуть
+            # конвой вперёд → дедлок: агент ждёт входа, конвой ждёт освобождения слота.
+            #
+            # РЕШЕНИЕ: после N REPLAN-попыток освобождаем слот N.
+            #   → slot_owners[N] = None
+            #   → _advance_convoy срабатывает: WAITING_SLOT агенты продвигаются вперёд
+            #   → входной слот (последний номер) освобождается физически
+            #   → в шаге 2.0 агент получает новый последний слот (входной) → путь есть
+            if ag.status == STATUS_CARRY_TO_PACKER and actions.get(ag.id) == 'REPLAN':
+                _ckey = f'carry_stuck_{ag.id}'
+                _cnt  = self._shelf_abort_count.get(_ckey, 0) + 1
+                self._shelf_abort_count[_ckey] = _cnt
+                _MAX_CARRY_REPLAN = 3   # попыток REPLAN перед освобождением слота
+
+                if _cnt >= _MAX_CARRY_REPLAN:
+                    pid = ag.current_suborder.packer_id if ag.current_suborder else None
+                    old_slot = ag.assigned_slot_num
+                    if pid and old_slot is not None:
+                        self.slot_manager.release_slot(pid, old_slot)
+                        logging.warning(
+                            f"  🔓 А{ag.id}: слот {old_slot} @ {ag.goal} физически "
+                            f"недостижим ({_cnt} REPLAN). Слот освобождён — конвой "
+                            f"продвинется, агент получит входной слот.")
+                    # Сбрасываем цель: шаг 2.0 переназначит на доступный слот
+                    ag.goal              = None
+                    ag.assigned_slot_num = None
+                    ag.shortest_path_len = 0
+                    if hasattr(self.router, 'invalidate_plan'):
+                        self.router.invalidate_plan(ag.id)
+                    self._shelf_abort_count.pop(_ckey, None)
+                    continue   # пропускаем добавление в tasks этот тик
+                else:
+                    logging.debug(f"  ⏳ А{ag.id}: CARRY слот {ag.assigned_slot_num} "
+                                  f"недостижим, попытка {_cnt}/{_MAX_CARRY_REPLAN}")
+                    # Продолжаем — tasks получит этот агент, A* попробует снова
 
             # RETURN_SHELF + REPLAN = агент застрял при возврате стеллажа.
             #
@@ -1087,6 +1262,14 @@ class AgentManager:
                             f"({_cnt} попыток). Груз СОХРАНЯЕТСЯ. "
                             f"Выдворяем IDLE-агентов поблизости.")
                         self._try_unblock_cargo_agent(ag)
+                        # Подробная диагностика пути (помогает выявить map-проблемы)
+                        if hasattr(self.router, '_algorithm') and \
+                           hasattr(self.router._algorithm, 'diagnose_path_failure'):
+                            _rs = (ag.status == STATUS_RETURN_SHELF)
+                            _diag = self.router._algorithm.diagnose_path_failure(
+                                ag.pos, ag.goal, self.reservations,
+                                ag.id, ag.has_cargo, _rs)
+                            logging.error(_diag)
                         self._shelf_abort_count[_rkey] = _MAX  # не переполняем лог
 
                     # Сброс пути и stuck-счётчика → новый маршрут в следующем тике
@@ -1096,7 +1279,7 @@ class AgentManager:
                     self.deadlock_resolver.stuck_since[ag.id] = self.current_tick
                     # Инвалидируем кэш плана (маршрут изменится)
                     if hasattr(self.router, 'invalidate_plan'):
-                        self.router.invalidate_plan()
+                        self.router.invalidate_plan(ag.id)  # только этот агент
                     continue   # остаёмся RETURN_SHELF, tasks не добавляем
 
                 else:
@@ -1125,24 +1308,18 @@ class AgentManager:
         # ── 6. Планирование и движение ───────────────────────────────────────
         paths = self.router.solve(tasks, reservations)
 
+        # Обновляем счётчик "нет пути" для диагностики консоли
+        for aid, path in paths.items():
+            if len(path) <= 1:
+                self._no_path_count[aid] = self._no_path_count.get(aid, 0) + 1
+            else:
+                self._no_path_count.pop(aid, None)
+
         # 6_L2. WFG-обнаружение циклов + локальный CBS (Уровень 2).
-        #
-        # БАГ 4 ПОЯСНЕНИЕ: для централизованных алгоритмов (CBS / LNS)
-        # WFG не нужен никогда:
-        #   • CBS / LNS строят глобально бесконфликтный план → циклических
-        #     дедлоков в плане нет по определению.
-        #   • RouterContext кэширует план и переиспользует его. При любом
-        #     отклонении (REPLAN, смена цели) — полный пересчёт, после которого
-        #     план снова бесконфликтен.
-        #   • WFG нужен только для реактивного A* (is_centralized=False),
-        #     где каждый агент строит путь независимо и может попасть в цикл.
-        #
-        # Вызываем WFG только для реактивного A*:
         if not self.router.is_centralized:
             paths = self.deadlock_resolver.resolve_local_deadlocks(
                 self.agents, paths, tasks, self.current_tick,
                 reservations=reservations)
-        # Для CBS / LNS: пропускаем WFG, план уже бесконфликтен.
 
         # 6a. Записываем пути (ещё не двигаемся)
         for aid, path in paths.items():
@@ -1152,19 +1329,24 @@ class AgentManager:
             if actual_len > 0 and actual_len != ag.shortest_path_len:
                 ag.shortest_path_len = 0
             ag.path               = path
-            ag.current_path_index = 1  # path[0]=cur pos, path[1]=next step
+            ag.current_path_index = 1
 
         # 6b. Финальный enforcement: vertex + swap + IDLE-уступка.
         allowed_to_move, idle_displacements = self.deadlock_resolver.resolve_movement_conflicts(
             self.agents, paths, self.current_tick)
 
-        # 6c. move() только для разрешённых активных агентов (есть путь от роутера)
+        # 6c. move() только для разрешённых активных агентов
         for aid, path in paths.items():
             ag = self.agents[aid]
+            prev_pos = ag.pos
             if aid in allowed_to_move and len(path) >= 2:
                 ag.move()
+                if ag.pos != prev_pos:
+                    self._last_move_tick[aid] = self.current_tick
             else:
-                ag.current_path_index = 0  # перепланировать в следующем тике
+                ag.current_path_index = 0
+                if self.router.is_centralized and hasattr(self.router, 'notify_blocked'):
+                    self.router.notify_blocked(aid)
 
         # 6d. Физические смещения IDLE-агентов (уступили дорогу активному агенту).
         # IDLE не имеют путей от роутера → ag.move() их не затрагивает.

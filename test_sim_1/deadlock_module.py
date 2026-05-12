@@ -279,99 +279,160 @@ class DeadlockResolver:
         idle_displ: Dict[int, Tuple]  = {}
         changed = True
 
-        # ── Pass 1: vertex-конфликты ──────────────────────────────────────
+        from agent_module import (STATUS_IDLE, STATUS_UNLOADING,
+                                   STATUS_WAITING_SLOT, STATUS_GO_TO_SHELF,
+                                   STATUS_CARRY_TO_PACKER, STATUS_RETURN_SHELF)
+        _cargo_statuses     = (STATUS_CARRY_TO_PACKER, STATUS_RETURN_SHELF)
+        _yieldable_statuses = (STATUS_IDLE, STATUS_GO_TO_SHELF)
+
+        def _is_yieldable(oag) -> bool:
+            """
+            Агент уступает дорогу cargo-агенту если:
+              • Статус IDLE или GO_TO_SHELF (мягкие статусы)
+              • ИЛИ goal is None — агент без цели (CARRY без слота, застрявший
+                агент), физически стоит на месте и не планирует двигаться.
+                БАГ А+В ИСПРАВЛЕНИЕ: CARRY_TO_PACKER с goal=None (потерял слот)
+                раньше не считался yieldable → Level-3 не выталкивал его →
+                cargo-агент навсегда застревал рядом, хотя CBS строил путь через него.
+            """
+            if oag.status in _yieldable_statuses:
+                return True
+            if getattr(oag, 'goal', None) is None:
+                return True   # нет цели → агент стоит на месте → должен уступить
+            return False
+
+        def _effective_score(ag) -> float:
+            """Score агента с бонусом +500 за наличие груза."""
+            if ag is None:
+                return 0.0
+            base = ag.score
+            # Груз = абсолютный приоритет над агентами без груза
+            if getattr(ag, 'has_cargo', False):
+                base += 500.0
+            return base
+
+        # ── Pass 1: vertex-конфликты (с приоритетом груза) ───────────────────
+        #
+        # КРИТИЧЕСКИЙ БАГ ИСПРАВЛЕНИЕ:
+        # Ранее: агент А14 (застрял, next_pos==pos) и агент А12 (движется, next_pos=А14.pos)
+        # обрабатывались ОДИНАКОВО — победитель определялся по score.
+        # А12 (score 6.11 > 4.64) "побеждал" → А14 "проигрывал" → А14 "заблокирован"
+        # (остаётся на месте), А12 ДВИЖЕТСЯ ТУДА ЖЕ → физическое наложение!
+        #
+        # ИСПРАВЛЕНИЕ: статичные агенты (next_pos==pos, т.е. не двигаются)
+        # PRE-CLAIM свою позицию ДО того как двигающиеся агенты её займут.
+        # Движущийся агент ВСЕГДА проигрывает статичному — нельзя войти в
+        # клетку, которую занимает агент без намерения уйти.
         while changed:
             changed = False
-            # Клетки назначения для разрешённых агентов
             claimed: Dict[Tuple, int] = {}
+
+            # Шаг 1a: статичные агенты (остаются на месте) занимают свои позиции первыми
             for aid in list(allowed):
+                if next_pos[aid] == agents[aid].pos:
+                    # Этот агент не движется (застрял, на цели, или ждёт)
+                    # Его позиция неприкосновенна для движущихся агентов
+                    claimed[next_pos[aid]] = aid
+
+            # Шаг 1b: движущиеся агенты проверяют конфликты
+            for aid in list(allowed):
+                if next_pos[aid] == agents[aid].pos:
+                    continue  # статичный: уже обработан выше
+
                 pos = next_pos[aid]
                 if pos in claimed:
-                    # Конфликт: оставляем агента с бо́льшим score
                     other = claimed[pos]
                     ag    = agents.get(aid)
                     ag_o  = agents.get(other)
-                    s     = ag.score    if ag   else 0.0
-                    s_o   = ag_o.score  if ag_o else 0.0
-                    loser = aid if s <= s_o else other
-                    winner = other if loser == aid else aid
+                    # Если other статичен (остаётся) → движущийся ВСЕГДА проигрывает
+                    other_is_static = (next_pos.get(other) == agents[other].pos
+                                       if other in agents else True)
+                    if other_is_static:
+                        loser  = aid
+                        winner = other
+                    else:
+                        s, s_o = _effective_score(ag), _effective_score(ag_o)
+                        loser  = aid if s <= s_o else other
+                        winner = other if loser == aid else aid
+
                     if loser in allowed:
                         allowed.discard(loser)
                         next_pos[loser] = agents[loser].pos
-                        claimed[pos] = winner
-                        changed = True
+                        claimed[pos]    = winner
+                        changed         = True
                 else:
-                    # Проверяем что целевая клетка физически свободна
+                    # Проверяем статичных агентов НЕ из next_pos (IDLE, etc.)
+                    blocked_by_static = False
                     for oid, oag in agents.items():
-                        if oid in next_pos: continue  # движущийся — не статик
-                        if oag.pos == pos:
-                            allowed.discard(aid)
-                            next_pos[aid] = agents[aid].pos
-                            changed = True
-                            break
+                        if oid in next_pos: continue
+                        if oag.pos != pos:  continue
+                        ag = agents.get(aid)
+                        if getattr(ag, 'has_cargo', False) and _is_yieldable(oag):
+                            vacated  = ag.pos
+                            conflict = any(
+                                oid2 != oid and next_pos.get(oid2) == vacated
+                                for oid2 in next_pos)
+                            if not conflict:
+                                idle_displ[oid] = vacated
+                            else:
+                                blocked_by_static = True
+                        else:
+                            blocked_by_static = True
+                        break
+                    if blocked_by_static:
+                        allowed.discard(aid)
+                        next_pos[aid] = agents[aid].pos
+                        changed = True
                     else:
                         claimed[pos] = aid
 
-        # ── Pass 2: chain-push IDLE-агентов ──────────────────────────────
-        # Если активный агент заблокирован IDLE-агентом, IDLE уступает:
-        # он смещается на клетку, которую покидает активный.
+        # ── Pass 2: chain-push (cargo вытесняет yieldable агентов) ──────────
         for aid in list(allowed):
             ag = agents.get(aid)
             if ag is None: continue
+            # Только cargo-агенты инициируют вытеснение
+            if not getattr(ag, 'has_cargo', False): continue
+
             target = next_pos[aid]
-            # Ищем IDLE/WAITING_SLOT агента на target
             blocker_id = None
             for oid, oag in agents.items():
-                if oid not in next_pos and oag.pos == target:
-                    if oag.status in (STATUS_IDLE,):
-                        blocker_id = oid
-                    break
+                if oid in next_pos:   continue
+                if oid in idle_displ: continue
+                if oag.pos != target: continue
+                if _is_yieldable(oag):          # ← используем расширенную проверку
+                    blocker_id = oid
+                break
+
             if blocker_id is None: continue
-            blocker = agents[blocker_id]
-            # Смещаем blocker на текущую позицию активного агента (цепочка)
-            vacated = ag.pos
-            # Проверяем что vacated не будет занята другим
+            vacated  = ag.pos
             conflict = any(
                 oid != blocker_id and next_pos.get(oid) == vacated
                 for oid in next_pos)
             if not conflict:
                 idle_displ[blocker_id] = vacated
-                logging.debug(f"  [L3] chain-push: А{blocker_id} "
-                              f"{blocker.pos}→{vacated}")
+                logging.debug(f"  [L3] cargo-push: А{blocker_id} "
+                              f"({agents[blocker_id].status}/goal={getattr(agents[blocker_id],'goal',None)}) "
+                              f"уступает А{aid} (груз) → {vacated}")
 
-        # ── Pass 3: swap-конфликты (БАГ 3 ИСПРАВЛЕНИЕ) ───────────────────
-        #
-        # Сценарий осцилляции ↑↓:
-        #   Тик T:   A хочет на pos(B), B хочет на pos(A) → swap.
-        #            Оба блокируются → оба стоят.
-        #   Тик T+1: CBS строит те же пути → тот же swap → вечный цикл.
-        #
-        # Исправление:
-        #   Оба блокируются (как раньше), НО лузер получает force_wait
-        #   на _SWAP_WAIT_TICKS тиков через _swap_losers_pending.
-        #   Тик T+1: лузер → WAIT, победитель планирует свободно → swap разрешён.
-        #   Случайный jitter предотвращает симметричные новые swap.
+        # ── Pass 3: swap-конфликты (cargo + force_wait для лузера) ──────────
         aid_list = list(allowed)
         for i, a1 in enumerate(aid_list):
             for a2 in aid_list[i + 1:]:
                 ag1, ag2 = agents.get(a1), agents.get(a2)
                 if ag1 is None or ag2 is None: continue
-                # Swap: A хочет на pos(B) и B хочет на pos(A)
                 if next_pos.get(a1) == ag2.pos and next_pos.get(a2) == ag1.pos:
-                    # Определяем лузера по score (меньший score уступает)
-                    loser  = a1 if (ag1.score <= ag2.score) else a2
+                    # Груз всегда побеждает агента без груза в swap
+                    s1    = _effective_score(ag1)
+                    s2    = _effective_score(ag2)
+                    loser  = a1 if s1 <= s2 else a2
                     winner = a2 if loser == a1 else a1
-                    # Блокируем обоих на этот тик (физически нельзя свапнуться)
-                    allowed.discard(a1)
-                    allowed.discard(a2)
-                    next_pos[a1] = ag1.pos
-                    next_pos[a2] = ag2.pos
-                    # Лузер получает force_wait → разрывает осцилляцию
+                    allowed.discard(a1); allowed.discard(a2)
+                    next_pos[a1] = ag1.pos; next_pos[a2] = ag2.pos
                     jitter = loser % 3
                     until  = self._current_tick + _SWAP_WAIT_TICKS + jitter
                     self._force_wait_until[loser] = until
                     logging.info(f"  [L3] swap А{a1}↔А{a2}: "
-                                 f"лузер=А{loser} (score {agents[loser].score:.2f}) "
+                                 f"лузер=А{loser} (score-eff {min(s1,s2):.0f}) "
                                  f"→ force_wait до тика {until}")
 
         return allowed, idle_displ

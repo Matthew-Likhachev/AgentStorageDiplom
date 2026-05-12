@@ -20,9 +20,12 @@ import heapq, logging, random, copy
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple, Set, Optional, Type
 
-# Маркер постоянной брони (статичные агенты, занятые слоты).
-# Движущиеся агенты используют t_end=0 → блокируют только в t=0.
-_PERM: int = 99_999
+# Брони reservations: три уровня приоритета.
+# t_end == 0          → движущийся агент; блокирует только t=0
+# t_end == _IDLE_PERM → IDLE-агент; cargo проезжает, no-cargo огибает
+# t_end == _PERM      → жёсткий блок (WAITING_SLOT / UNLOADING / слоты)
+_PERM:      int = 99_999
+_IDLE_PERM: int = 99_998   # = _PERM - 1; IDLE: мягкая для cargo, жёсткая для no-cargo
 
 
 class IRouter(ABC):
@@ -58,35 +61,56 @@ class RoutingAlgorithmRegistry:
 
 class RouterContext:
     """
-    Контекст алгоритма + кэш плана для централизованных методов.
+    Контекст алгоритма + двухрежимное кэширование путей.
 
-    Кэш плана (CBS / LNS-1 / LNS-2):
-      Централизованные алгоритмы строят бесконфликтный план сразу для всех
-      агентов. Пересчитывать его каждый тик дорого и бессмысленно — план
-      остаётся валидным, пока агенты следуют ему шаг за шагом.
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ РЕЖИМ A: Centralized (CBS / LNS-1 / LNS-2)                         │
+    │                                                                     │
+    │ Единый глобальный план на всех агентов. Пересчёт — только если     │
+    │ агент отклонился от плана или поменял цель. WFG не нужен.          │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │ РЕЖИМ B: Per-agent (Prioritized A*)                                 │
+    │                                                                     │
+    │ Каждый агент хранит свой отдельный кэшированный путь.              │
+    │                                                                     │
+    │ Порядок разрешения конфликта (от мягкого к жёсткому):              │
+    │   1. Level-3 (resolve_movement_conflicts) блокирует движение       │
+    │      — агент остаётся на месте. Следующий тик: RouterContext        │
+    │      возвращает тот же кэшированный путь (retry без A*).           │
+    │   2. Level-2 (WFG) обнаруживает цикл ожидания → force_wait         │
+    │      для лузера. Лузер ждёт N тиков и повторяет тот же путь.      │
+    │   3. Level-1 (check_and_resolve) фиксирует: агент не двигался      │
+    │      stuck_threshold тиков → действие REPLAN → RouterContext        │
+    │      вызывает A* только для этого агента; остальные — из кэша.     │
+    │                                                                     │
+    │ A* НЕ вызывается каждый тик. Вызывается только при REPLAN          │
+    │ (локальное разрешение исчерпано) или при первом планировании.      │
+    └─────────────────────────────────────────────────────────────────────┘
 
-      Кэш сохраняет полные пути. Каждый тик RouterContext проверяет:
-        • Тот же набор агентов?
-        • Те же цели?
-        • Каждый агент на ожидаемой позиции (или продвинулся на один шаг)?
-      Если всё сходится — возвращает сдвинутые пути из кэша без вызова solver.
-      При любом отклонении (REPLAN, новая цель, новый агент) — полный пересчёт.
-
-    plan_was_recomputed:
-      True  → план только что пересчитан; AgentManager может пропустить WFG.
-      False → использован кэш; конфликтов нет по определению, WFG тоже пропускать.
-      Итого: для CBS/LNS WFG не нужен никогда (см. agent_module.py, шаг 6).
-
-    swap_losers:
-      Агенты, проигравшие swap-конфликт в Level-3. На следующем тике
-      check_and_resolve назначит им WAIT → разрывает осцилляцию ↑↓.
+    Поля:
+      plan_was_recomputed — True если на этом тике хотя бы один агент
+                            был перепланирован (любой режим).
+      swap_losers         — агенты, проигравшие swap в Level-3.
     """
     def __init__(self, algorithm: IRouter):
-        self._algorithm          = algorithm
+        self._algorithm               = algorithm
         self._map_data: Optional[Dict] = None
         self._cached_paths: Dict[int, List[Tuple]] = {}
+        self._cached_has_cargo: Dict[int, bool]    = {}
         self.plan_was_recomputed: bool = True
-        self.swap_losers: Set[int] = set()   # читает DeadlockResolver
+        self.swap_losers: Set[int]    = set()
+        # Агенты, заблокированные Level-3 на прошлом тике.
+        # Для централизованных: блокировка любого = план устарел → пересчёт.
+        # (Причина: MAPF-план строится в time-space. Если агент не сделал шаг,
+        # а остальные продолжили, временны́е координаты плана нарушены → коллизии.)
+        self._blocked_agents: Set[int] = set()
+
+    def notify_blocked(self, agent_id: int):
+        """
+        Сообщает роутеру что Level-3 заблокировал агента (он не сделал шаг).
+        Для централизованных алгоритмов: следующий тик → полный пересчёт плана.
+        """
+        self._blocked_agents.add(agent_id)
 
     @property
     def is_centralized(self) -> bool:
@@ -97,27 +121,51 @@ class RouterContext:
             raise RuntimeError("Вызовите set_map_data() сначала.")
         self._algorithm = RoutingAlgorithmRegistry.create(name, self._map_data, **kw)
         self._cached_paths.clear()
+        self._cached_has_cargo.clear()
         self.plan_was_recomputed = True
 
     def set_map_data(self, map_data: Dict):
         self._map_data = map_data
 
-    def invalidate_plan(self):
-        """Сброс кэша — вызывать при изменении состояния агентов."""
-        self._cached_paths.clear()
+    def invalidate_plan(self, agent_id: Optional[int] = None):
+        """Сброс кэша. agent_id=None → все агенты; иначе только указанный."""
+        if agent_id is not None:
+            self._cached_paths.pop(agent_id, None)
+            self._cached_has_cargo.pop(agent_id, None)
+        else:
+            self._cached_paths.clear()
+            self._cached_has_cargo.clear()
         self.plan_was_recomputed = True
 
     def solve(self, tasks: List[Dict], reservations: Dict
               ) -> Dict[int, List[Tuple]]:
-        if not self.is_centralized:
-            self.plan_was_recomputed = True
-            return self._algorithm.solve(tasks, reservations)
+        if self.is_centralized:
+            return self._solve_centralized(tasks, reservations)
+        return self._solve_astar_cached(tasks, reservations)
 
-        # ── Централизованный: кэшируем план ──────────────────────────────────
+    # ── Режим A: централизованный (CBS / LNS) ────────────────────────────────
+    def _solve_centralized(self, tasks: List[Dict],
+                           reservations: Dict) -> Dict[int, List[Tuple]]:
         task_map    = {t['agent_id']: t for t in tasks}
         current_ids = set(task_map)
         result: Dict[int, List[Tuple]] = {}
-        can_reuse = bool(self._cached_paths) and current_ids == set(self._cached_paths)
+
+        # Если Level-3 заблокировал хотя бы одного агента в прошлом тике →
+        # план MAPF устарел (time-space координаты нарушены) → полный пересчёт.
+        any_blocked = bool(self._blocked_agents)
+        self._blocked_agents.clear()
+
+        # Если Level-1 выдал REPLAN хотя бы одному агенту → план требует пересчёта.
+        # БАГ Б: ранее REPLAN игнорировался (кэш возвращался без проверки action),
+        # из-за чего застрявшие агенты никогда не получали новый план.
+        any_replan = any(t.get('action') == 'REPLAN' for t in tasks)
+
+        can_reuse = (
+            bool(self._cached_paths)
+            and not any_blocked          # никто не был заблокирован прошлый тик
+            and not any_replan           # Level-1 не требует пересчёта
+            and current_ids == set(self._cached_paths)
+        )
 
         if can_reuse:
             for aid, task in task_map.items():
@@ -133,20 +181,113 @@ class RouterContext:
                     can_reuse = False; break
 
         if can_reuse:
-            self._cached_paths = result
+            self._cached_paths       = result
             self.plan_was_recomputed = False
             for aid, path in result.items():
                 for i, pos in enumerate(path[1:], 1):
                     reservations.setdefault(pos, []).append(
                         {'agent_id': aid, 't_start': i, 't_end': i})
-            logging.debug("[RouterContext] кэш переиспользован")
+            logging.debug("[RouterContext/CBS] кэш переиспользован")
             return result
 
-        # Полный пересчёт
         paths = self._algorithm.solve(tasks, reservations)
-        self._cached_paths       = dict(paths)
+
+        # БАГ: не кэшировать провальные пути (len ≤ 1 = алгоритм не нашёл маршрут).
+        # Провальный путь в кэше → следующий тик снова возвращает провальный кэш
+        # (can_reuse=False из-за goal mismatch, но полный re-solve даёт тот же результат).
+        # Без кэша → re-solve каждый тик до разрешения ситуации.
+        self._cached_paths = {aid: p for aid, p in paths.items() if len(p) > 1}
         self.plan_was_recomputed = True
         return paths
+
+    # ── Режим B: per-agent A* с кэшем ────────────────────────────────────────
+    def _solve_astar_cached(self, tasks: List[Dict],
+                             reservations: Dict) -> Dict[int, List[Tuple]]:
+        """
+        Кэш на агента для Prioritized A* с приоритетом груза (cargo-first).
+
+        CARGO-FIRST — двухфазное планирование:
+        ─────────────────────────────────────────
+        Фаза 1 — агенты С ГРУЗОМ (CARRY_TO_PACKER / RETURN_SHELF):
+          1a. В reservations добавляются пути кэшированных cargo-агентов.
+          1b. Cargo-агенты с REPLAN запускают A* — видят только _PERM блоки
+              и позиции других cargo-агентов. No-cargo пути ещё НЕ добавлены
+              → cargo получает свободные corridor-позиции.
+
+        Фаза 2 — агенты БЕЗ ГРУЗА (GO_TO_SHELF):
+          2a. В reservations добавляются пути кэшированных no-cargo-агентов.
+          2b. No-cargo с REPLAN планируются В ОБХОД всего cargo.
+
+        Итог: груз ВСЕГДА имеет приоритет в пространстве путей.
+        Level-3 (resolve_movement_conflicts) дополнительно обеспечивает
+        физический приоритет cargo в конфликтах (cargo +500 к score).
+        """
+        result:         Dict[int, List[Tuple]] = {}
+        cargo_replan:   List[Dict]             = []
+        nocargo_replan: List[Dict]             = []
+
+        for task in tasks:
+            aid       = task['agent_id']
+            action    = task.get('action', 'OK')
+            start     = task['start']
+            goal      = task['goal']
+            has_cargo = task.get('has_cargo', False)
+
+            if action == 'WAIT':
+                result[aid] = [start]
+                continue
+
+            cached    = self._cached_paths.get(aid)
+            need_plan = (action == 'REPLAN' or cached is None or cached[-1] != goal)
+
+            if not need_plan:
+                if cached[0] == start:
+                    result[aid]                 = cached
+                    self._cached_has_cargo[aid] = has_cargo
+                elif len(cached) >= 2 and cached[1] == start:
+                    advanced                    = cached[1:]
+                    self._cached_paths[aid]     = advanced
+                    self._cached_has_cargo[aid] = has_cargo
+                    result[aid]                 = advanced
+                else:
+                    need_plan = True
+
+            if need_plan:
+                (cargo_replan if has_cargo else nocargo_replan).append(task)
+
+        def _cache_paths(new_paths: Dict, is_cargo: bool):
+            for aid, path in new_paths.items():
+                self._cached_has_cargo[aid] = is_cargo
+                if len(path) > 1:
+                    self._cached_paths[aid] = path
+                else:
+                    self._cached_paths.pop(aid, None)
+                result[aid] = path
+
+        def _reserve_cached(cargo_only: bool):
+            for aid, path in result.items():
+                if self._cached_has_cargo.get(aid, False) == cargo_only:
+                    for i, pos in enumerate(path[1:], 1):
+                        reservations.setdefault(pos, []).append(
+                            {'agent_id': aid, 't_start': i, 't_end': i})
+
+        # Фаза 1: cargo ───────────────────────────────────────────────────────
+        _reserve_cached(cargo_only=True)                          # 1a
+        if cargo_replan:                                          # 1b
+            _cache_paths(self._algorithm.solve(cargo_replan, reservations), True)
+
+        # Фаза 2: no-cargo (планируется В ОБХОД cargo) ────────────────────────
+        _reserve_cached(cargo_only=False)                         # 2a
+        if nocargo_replan:                                        # 2b
+            _cache_paths(self._algorithm.solve(nocargo_replan, reservations), False)
+
+        n_replan = len(cargo_replan) + len(nocargo_replan)
+        if n_replan:
+            logging.debug(f"[RouterContext/A*] cargo={len(cargo_replan)} "
+                          f"no-cargo={len(nocargo_replan)} replanned / {len(tasks)} total")
+        self.plan_was_recomputed = n_replan > 0
+        return result
+
 
     def path_length(self, start, goal, has_cargo=False, returning_shelf=False) -> int:
         if hasattr(self._algorithm, 'path_length'):
@@ -191,36 +332,66 @@ class BaseGridRouter(IRouter):
             (d for d, (odr, odc) in self.DIR_OFFSETS.items()
              if dr == odr and dc == odc), None)
         if direction is None: return False
+
         if returning_shelf:
-            if self.cell_types.get(to, 'F') == 'S': return True
-            return direction in (self.dirs_loaded.get(frm, set()) |
-                                 self.dirs_empty.get(frm, set()))
+            to_type = self.cell_types.get(to, 'F')
+            # Целевой стеллаж — всегда доступен
+            if to_type == 'S': return True
+            # Физические барьеры
+            if to_type in ('W', 'E'): return False
+            # Специальные ячейки (фасовщик P, очередь Z): стандартные направления
+            if to_type in ('P', 'Z'):
+                return direction in (self.dirs_loaded.get(frm, set()) |
+                                     self.dirs_empty.get(frm, set()))
+            # Напольные ячейки (F и другие): ПОЛНАЯ свобода движения.
+            #
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: ранее использовались dirs_loaded|dirs_empty,
+            # что блокировало агентов возврата в "однонаправленных" ячейках.
+            # Агент CARRY_TO_PACKER входил в такую ячейку по трафику (E/S),
+            # затем RETURN_SHELF не мог выйти в нужном направлении (N/W) —
+            # perpetual "нет пути". Теперь возвратные агенты свободны на F-ячейках.
+            # Level-3 (resolve_movement_conflicts) обеспечит физическую корректность.
+            return True
+
         allowed = (self.dirs_loaded.get(frm, set()) if has_cargo
                    else self.dirs_empty.get(frm, set()))
         return direction in allowed
 
-    def _is_blocked(self, pos: Tuple, t: int, res: Dict, req_id: int) -> bool:
+    def _is_blocked(self, pos: Tuple, t: int, res: Dict,
+                    req_id: int, has_cargo: bool = False) -> bool:
         """
-        t_end == 0    → движущийся агент; блокирует только в t == 0.
-        t_end == _PERM → постоянный блок (IDLE/WAITING_SLOT/слот); блокирует всегда.
-        иначе         → временная бронь [t_start, t_end].
+        Проверяет занятость pos в момент t.
+
+        t_end == 0         → движущийся агент; блокирует только в t == 0.
+        t_end == _IDLE_PERM → IDLE-агент; блокирует no-cargo; НЕ блокирует cargo
+                              (cargo имеет право пути, Level-3 вытолкнет IDLE).
+        t_end == _PERM      → постоянный блок (WAITING_SLOT/слот/UNLOADING); блокирует всегда.
+        иначе              → временная бронь [t_start, t_end].
         """
         for b in res.get(pos, []):
-            if b['agent_id'] == req_id: continue
+            if b['agent_id'] == req_id:
+                continue
             t_end = b['t_end']
             if b['t_start'] == 0 and t_end == 0:
-                if t == 0: return True
+                # Движущийся агент: блок только в t=0
+                if t == 0:
+                    return True
+            elif t_end == _IDLE_PERM:
+                # IDLE-агент: cargo проезжает (будет вытеснен Level-3)
+                if not has_cargo:
+                    return True
             elif b['t_start'] <= t <= t_end:
                 return True
         return False
 
     def _is_swap(self, frm: Tuple, to: Tuple, t: int,
                  res: Dict, req_id: int) -> bool:
-        """Блокирует swap. Начальные/постоянные брони — не признак движения."""
+        """Блокирует swap. Начальные/постоянные/IDLE брони — не признак движения."""
         for b in res.get(frm, []):
             if b['agent_id'] == req_id: continue
             t_end = b['t_end']
-            if t_end == 0 or t_end >= _PERM: continue   # не swap-сигнал
+            # t_end==0 (движущийся), t_end>=_IDLE_PERM (постоянный или IDLE) → не swap
+            if t_end == 0 or t_end >= _IDLE_PERM: continue
             if b['t_start'] <= t <= t_end: return True
         return False
 
@@ -241,13 +412,67 @@ class BaseGridRouter(IRouter):
                 if returning_shelf and self.cell_types.get(nb, 'F') == 'S' and nb != goal: continue
                 if not self._can_move(cur, nb, has_cargo, returning_shelf): continue
                 ng = g[cur] + 1
-                if self._is_blocked(nb, ng, res, aid): continue
+                if self._is_blocked(nb, ng, res, aid, has_cargo): continue
                 if self._is_swap(cur, nb, ng, res, aid): continue
                 if nb not in g or ng < g[nb]:
                     g[nb] = ng; came[nb] = cur
                     h = abs(nb[0] - goal[0]) + abs(nb[1] - goal[1])
                     heapq.heappush(frontier, (ng + h, nb))
         return None
+
+    def diagnose_path_failure(self, start: Tuple, goal: Tuple,
+                               res: Dict, aid: int,
+                               has_cargo: bool, returning_shelf: bool) -> str:
+        """
+        Вызывается когда A* не нашёл путь. Возвращает строку-объяснение:
+        - Тип и доступные направления стартовой клетки
+        - Почему каждый сосед недоступен (стена / запрет направления / агент)
+        - Тип целевой клетки и её доступность в принципе
+        """
+        lines: List[str] = [
+            f"  🔍 ДИАГНОСТИКА пути А{aid} {start}→{goal} "
+            f"({'cargo' if has_cargo else 'empty'}"
+            f"{', ret' if returning_shelf else ''}):"]
+
+        # Тип стартовой клетки и разрешённые направления
+        c_type = self.cell_types.get(start, '?')
+        d_load = self.dirs_loaded.get(start, set())
+        d_empty = self.dirs_empty.get(start, set())
+        lines.append(f"    Старт {start}: тип='{c_type}' "
+                     f"dirs_loaded={sorted(d_load)} dirs_empty={sorted(d_empty)}")
+
+        # Анализ всех 4 соседей
+        for d, (dr, dc) in self.DIR_OFFSETS.items():
+            nb = (start[0] + dr, start[1] + dc)
+            reasons = []
+            if not self._is_valid(nb):
+                reasons.append("вне карты/стена")
+            else:
+                nb_type = self.cell_types.get(nb, 'F')
+                if returning_shelf and nb_type == 'S':
+                    reasons.append("S-доступна (ret)")
+                elif not self._can_move(start, nb, has_cargo, returning_shelf):
+                    reasons.append(f"запрет напр '{d}' (из {c_type}→{nb_type})")
+                else:
+                    blocked = self._is_blocked(nb, 1, res, aid, has_cargo)
+                    if blocked:
+                        agents_at = [b for b in res.get(nb, [])
+                                     if b['agent_id'] != aid]
+                        who = [(f"А{b['agent_id']} t_end={b['t_end']}") for b in agents_at]
+                        reasons.append(f"занято: {', '.join(who)}")
+                    else:
+                        reasons.append("СВОБОДНО ✓")
+
+            lines.append(f"    Сосед [{d}] {nb}: {'; '.join(reasons)}")
+
+        # Целевая клетка
+        g_type = self.cell_types.get(goal, '?')
+        g_valid = self._is_valid(goal)
+        g_blocked = self._is_blocked(goal, 99, res, aid, has_cargo) if g_valid else True
+        lines.append(f"    Цель  {goal}: тип='{g_type}' "
+                     f"valid={g_valid} blocked_t99={g_blocked}")
+
+        return "\n".join(lines)
 
     def path_length(self, start, goal, has_cargo=False, returning_shelf=False) -> int:
         p = self._astar(start, goal, {}, -1, has_cargo, returning_shelf)
@@ -274,18 +499,53 @@ class PrioritizedAStarSolver(BaseGridRouter):
 
     def solve(self, tasks, reservations):
         result  = {}
-        ordered = sorted(tasks, key=lambda x: x.get('score', 0.0), reverse=True)
+        ordered = sorted(tasks,
+                         key=lambda x: (1 if x.get('has_cargo', False) else 0,
+                                        x.get('score', 0.0)),
+                         reverse=True)
+        if not hasattr(self, '_fail_count'):
+            self._fail_count: Dict[int, int] = {}
+
         for t in ordered:
             aid = t['agent_id']; start = t['start']; goal = t['goal']
             hc  = t.get('has_cargo', False); rs = t.get('returning_shelf', False)
             if t.get('action') == 'WAIT': result[aid] = [start]; continue
             if start == goal:            result[aid] = [start]; continue
+
             path = self._astar(start, goal, reservations, aid, hc, rs)
+
+            if path is None and hc:
+                # ── ЭКСТРЕННЫЙ A*: попытка без time-indexed броней ─────────────
+                # Применяется когда cargo-агент не может найти путь из-за
+                # временны́х резерваций других агентов. Оставляем только
+                # постоянные блоки (_PERM / _IDLE_PERM) — физические препятствия.
+                # Level-3 разрешит физические конфликты при исполнении шага.
+                hard_res = {
+                    pos: [b for b in blist if b['t_end'] >= _IDLE_PERM]
+                    for pos, blist in reservations.items()
+                    if any(b['t_end'] >= _IDLE_PERM for b in blist)
+                }
+                path = self._astar(start, goal, hard_res, aid, hc, rs)
+                if path:
+                    logging.info(f"[A*] А{aid}: ЭКСТРЕННЫЙ маршрут "
+                                 f"(без мягких броней) {start}→{goal}")
+
             if path:
-                result[aid] = path; self._reserve(path, aid, reservations)
+                self._fail_count.pop(aid, None)
+                result[aid] = path
+                self._reserve(path, aid, reservations)
             else:
-                logging.warning(f"[A*] нет пути: А{aid} {start}→{goal}")
+                fc = self._fail_count.get(aid, 0) + 1
+                self._fail_count[aid] = fc
+                if fc <= 2 or fc % 20 == 0:
+                    logging.warning(f"[A*] нет пути: А{aid} {start}→{goal} "
+                                    f"(попытка {fc})")
+                if fc == 3 and hasattr(self, 'diagnose_path_failure'):
+                    # Диагностика — один раз при первых 3 попытках
+                    logging.warning(self.diagnose_path_failure(
+                        start, goal, reservations, aid, hc, rs))
                 result[aid] = [start]
+
         return result
 
 
@@ -404,7 +664,7 @@ class CBSSolver(BaseGridRouter):
                 if returning_shelf and self.cell_types.get(nb, 'F') == 'S' and nb != goal: continue
                 if not self._can_move(cur, nb, has_cargo, returning_shelf): continue
                 if (nb, nt) in forbidden: continue
-                if self._is_blocked(nb, nt, res, aid): continue
+                if self._is_blocked(nb, nt, res, aid, has_cargo): continue
                 if self._is_swap(cur, nb, nt, res, aid): continue
                 state = (nb, nt)
                 ng = g.get((cur, t), float('inf')) + 1
