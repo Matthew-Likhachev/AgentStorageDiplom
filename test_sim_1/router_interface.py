@@ -334,24 +334,15 @@ class BaseGridRouter(IRouter):
         if direction is None: return False
 
         if returning_shelf:
-            to_type = self.cell_types.get(to, 'F')
             # Целевой стеллаж — всегда доступен
-            if to_type == 'S': return True
+            if self.cell_types.get(to, 'F') == 'S': return True
             # Физические барьеры
-            if to_type in ('W', 'E'): return False
-            # Специальные ячейки (фасовщик P, очередь Z): стандартные направления
-            if to_type in ('P', 'Z'):
-                return direction in (self.dirs_loaded.get(frm, set()) |
-                                     self.dirs_empty.get(frm, set()))
-            # Напольные ячейки (F и другие): ПОЛНАЯ свобода движения.
-            #
-            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: ранее использовались dirs_loaded|dirs_empty,
-            # что блокировало агентов возврата в "однонаправленных" ячейках.
-            # Агент CARRY_TO_PACKER входил в такую ячейку по трафику (E/S),
-            # затем RETURN_SHELF не мог выйти в нужном направлении (N/W) —
-            # perpetual "нет пути". Теперь возвратные агенты свободны на F-ячейках.
-            # Level-3 (resolve_movement_conflicts) обеспечит физическую корректность.
-            return True
+            if self.cell_types.get(to, 'F') in ('W', 'E'): return False
+            # Возвратный агент использует ОБА набора направлений (loaded+empty).
+            # Это даёт чуть больше свободы чем обычное движение,
+            # но НИКОГДА не нарушает правила трафика клетки.
+            return direction in (self.dirs_loaded.get(frm, set()) |
+                                 self.dirs_empty.get(frm, set()))
 
         allowed = (self.dirs_loaded.get(frm, set()) if has_cargo
                    else self.dirs_empty.get(frm, set()))
@@ -515,11 +506,8 @@ class PrioritizedAStarSolver(BaseGridRouter):
             path = self._astar(start, goal, reservations, aid, hc, rs)
 
             if path is None and hc:
-                # ── ЭКСТРЕННЫЙ A*: попытка без time-indexed броней ─────────────
-                # Применяется когда cargo-агент не может найти путь из-за
-                # временны́х резерваций других агентов. Оставляем только
-                # постоянные блоки (_PERM / _IDLE_PERM) — физические препятствия.
-                # Level-3 разрешит физические конфликты при исполнении шага.
+                # Уровень 2: без time-indexed броней (только _PERM/_IDLE_PERM).
+                # Направления ячеек при этом полностью соблюдаются.
                 hard_res = {
                     pos: [b for b in blist if b['t_end'] >= _IDLE_PERM]
                     for pos, blist in reservations.items()
@@ -527,8 +515,11 @@ class PrioritizedAStarSolver(BaseGridRouter):
                 }
                 path = self._astar(start, goal, hard_res, aid, hc, rs)
                 if path:
-                    logging.info(f"[A*] А{aid}: ЭКСТРЕННЫЙ маршрут "
-                                 f"(без мягких броней) {start}→{goal}")
+                    logging.info(f"[A*] А{aid}: маршрут без мягких броней "
+                                 f"{start}→{goal}")
+                    # Метрика 9: экстренное перепланирование
+                    if hasattr(self, '_metrics') and self._metrics:
+                        self._metrics.on_emergency_replan()
 
             if path:
                 self._fail_count.pop(aid, None)
@@ -718,6 +709,11 @@ class _LNSBase(BaseGridRouter):
       3. Возвращаем лучшее найденное решение.
 
     Разница LNS-1 vs LNS-2 — только в base_solver (CBS vs A*).
+
+    Оптимизация deepcopy:
+      Заменили copy.deepcopy(reservations) на _shallow_copy_res() —
+      мелкое копирование dict→{pos: list(blocks)}, в ~10× быстрее.
+      Блоки внутри неизменяемы во время итерации, поэтому safe.
     """
     is_centralized = True
 
@@ -727,6 +723,14 @@ class _LNSBase(BaseGridRouter):
         self.neighbourhood_size = neighbourhood_size
         self.max_iterations     = max_iterations
         self.base_solver        = base_solver or PrioritizedAStarSolver(map_data)
+        # Псевдонимы для совместимости
+        self.init_solver   = self.base_solver
+        self.repair_solver = self.base_solver
+
+    @staticmethod
+    def _shallow_copy_res(reservations: Dict) -> Dict:
+        """Быстрая мелкая копия резерваций (вместо copy.deepcopy)."""
+        return {pos: list(blocks) for pos, blocks in reservations.items()}
 
     def solve(self, tasks, reservations):
         if not tasks: return {}
@@ -734,23 +738,24 @@ class _LNSBase(BaseGridRouter):
         active   = [t for t in tasks if t.get('action') != 'WAIT']
         if not active: return waiting
 
-        best_paths = self.base_solver.solve(active, copy.deepcopy(reservations))
+        best_paths = self.base_solver.solve(active, self._shallow_copy_res(reservations))
         best_cost  = sum(len(p) for p in best_paths.values())
         task_map   = {t['agent_id']: t for t in active}
 
         for it in range(self.max_iterations):
             if len(active) <= 1: break
-            k          = min(self.neighbourhood_size, len(active))
-            chosen     = random.sample([t['agent_id'] for t in active], k)
-            partial    = copy.deepcopy(reservations)
+            k       = min(self.neighbourhood_size, len(active))
+            chosen  = random.sample([t['agent_id'] for t in active], k)
+            partial = self._shallow_copy_res(reservations)
             for aid, path in best_paths.items():
                 if aid not in chosen:
                     self._reserve(path, aid, partial)
-            new_sub    = self.base_solver.solve([task_map[a] for a in chosen], partial)
-            candidate  = {**best_paths, **new_sub}
-            new_cost   = sum(len(p) for p in candidate.values())
+            new_sub   = self.base_solver.solve([task_map[a] for a in chosen], partial)
+            candidate = {**best_paths, **new_sub}
+            new_cost  = sum(len(p) for p in candidate.values())
             if new_cost < best_cost:
-                best_paths = candidate; best_cost = new_cost
+                best_paths = candidate
+                best_cost  = new_cost
                 logging.debug(f"[LNS] ит.{it}: cost {best_cost}→{new_cost} ✅")
 
         for aid, path in best_paths.items():
@@ -767,26 +772,14 @@ class _LNSBase(BaseGridRouter):
 @RoutingAlgorithmRegistry.register("lns")
 class LNS1CBSSolver(_LNSBase):
     """
-    LNS-1: Large Neighbourhood Search (верхний) + CBS (нижний).
+    LNS-1: Large Neighbourhood Search + CBS на всех уровнях.
 
-    Верхний уровень (LNS):
-      Стохастический destroy-and-repair: случайно выбирает подмножество
-      агентов, «сносит» их пути и заново решает для них задачу.
-      Глобальная стоимость (sum-of-costs) используется как критерий улучшения.
+    Начальное решение: CBSSolver для всех активных агентов.
+    Repair каждой итерации: CBSSolver для k выбранных агентов.
+    Нет A* нигде — только LNS + CBS.
 
-    Нижний уровень (CBS):
-      Для каждого выбранного neighbourhood вызывается CBS → он строит
-      бесконфликтные пути с гарантией локальной оптимальности.
-      Пути остальных агентов зафиксированы как броня в reservations.
-
-    Итог: качество близко к CBS, но масштабируется на бо́льшие группы.
-    Конфликты ВНУТРИ neighbourhood гарантированно отсутствуют (CBS).
-    Конфликты МЕЖДУ neighbourhood и остальными агентами исключены резервациями.
-
-    СРАВНЕНИЕ: лучше A* и LNS-2 по качеству; медленнее их; слабее чистого CBS
-    на малых группах, но масштабируется туда где CBS упирается в лимит итераций.
-    Алиасы: "lns1_cbs", "lns1", "lns" (обратная совместимость).
-    Рекомендуется для 8-20 агентов.
+    Медленнее LNS-2, но даёт глобально лучшие пути без конфликтов.
+    Алиасы: "lns1_cbs", "lns1", "lns".
     """
     is_centralized = True
 

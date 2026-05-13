@@ -39,9 +39,11 @@ class DeadlockResolver:
     Создаётся AgentManager'ом, живёт всё время симуляции.
     """
 
-    def __init__(self, stuck_threshold: int = 8, map_data: Optional[Dict] = None):
+    def __init__(self, stuck_threshold: int = 8, map_data: Optional[Dict] = None,
+                 metrics=None):
         self.stuck_threshold = stuck_threshold
         self.map_data        = map_data
+        self.metrics         = metrics   # MetricsCollector | None
 
         # История позиций: {agent_id: [pos_t, pos_t-1, ...]}
         self.pos_history: Dict[int, List[Tuple]] = {}
@@ -131,12 +133,13 @@ class DeadlockResolver:
             # Проверяем прогресс (двигался ли агент за stuck_threshold тиков)
             ticks_stuck = current_tick - self.stuck_since.get(aid, current_tick)
             if ticks_stuck >= self.stuck_threshold:
-                # Агент не двигался слишком долго → REPLAN
                 jitter = aid % _FORCE_WAIT_TICKS
                 self._force_wait_until[aid] = current_tick + _FORCE_WAIT_TICKS + jitter
                 self.stuck_since[aid]       = current_tick
                 actions[aid]                = 'REPLAN'
                 logging.debug(f"  [L1] А{aid}: застрял {ticks_stuck} тиков → REPLAN")
+                if self.metrics:
+                    self.metrics.on_deadlock()   # Метрика 8: дедлок
             else:
                 actions[aid] = 'OK'
 
@@ -227,6 +230,8 @@ class DeadlockResolver:
         new_paths = dict(paths)
         for cycle in cycles:
             logging.info(f"  [L2] WFG цикл: {cycle} → локальное перепланирование")
+            if self.metrics:
+                self.metrics.on_deadlock()
             # Лузер (минимальный score) ждёт один тик
             task_map = {t['agent_id']: t for t in tasks}
             scores   = {aid: task_map[aid].get('score', 0.0)
@@ -434,5 +439,7 @@ class DeadlockResolver:
                     logging.info(f"  [L3] swap А{a1}↔А{a2}: "
                                  f"лузер=А{loser} (score-eff {min(s1,s2):.0f}) "
                                  f"→ force_wait до тика {until}")
+                    if self.metrics:
+                        self.metrics.on_collision()   # Метрика 7: столкновение
 
         return allowed, idle_displ

@@ -30,16 +30,16 @@ def main():
         "order_seed":  124,   # воспроизводимость заказов
         "num_agents":  20,
         "high_priority_threshold": 8,
-        "num_orders":     60,
-        "max_spawn_tick": 500,
+        "num_orders":     5,
+        "max_spawn_tick": 5_0,
 
         # ── Выбор алгоритма маршрутизации ─────────────────────────────────
         #
         # ┌─────────────────┬────────────────────────────────────────────────┐
         # │ Ключ            │ Описание                                       │
         # ├─────────────────┼────────────────────────────────────────────────┤
-        # │ prioritized_astar│ A* — жадный последовательный A*.               │
-        # │                 │ Каждый агент планируется независимо по score.  │
+        # │ prioritized_    │ A* — жадный последовательный A*.               │
+        # │ astar           │ Каждый агент планируется независимо по score.  │
         # │                 │ Быстрый, субоптимальный. WFG активен.          │
         # │                 │ Рекомендуется как BASE-LINE для сравнения.     │
         # │                 │ Хорошо для 10+ агентов.                        │
@@ -66,7 +66,7 @@ def main():
         # │                 │ Рекомендуется для 20+ агентов.                │
         # └─────────────────┴────────────────────────────────────────────────┘
         #
-        "router_algorithm": "lns1_cbs",   # ← выберите один из ключей выше
+        "router_algorithm": "cbs",   # ← выберите один из ключей выше
 
         "tick_delay_ms": 0,
     }
@@ -143,6 +143,10 @@ def main():
     router = RouterContext(_algo)
     router.set_map_data(import_res.map_data)
 
+    # Сборщик метрик
+    from metrics_collector import MetricsCollector
+    metrics = MetricsCollector(algorithm_name=_name, sim_params=config)
+
     # Зоны выдачи (slot == 1)
     packer_delivery_zones = {}
     for row in cells:
@@ -165,11 +169,37 @@ def main():
         inventory=inventory,
         packer_positions=packer_positions,
         packer_delivery_zones=packer_delivery_zones,
-        num_agents=config["num_agents"])
+        num_agents=config["num_agents"],
+        metrics=metrics)               # ← метрики
 
     # Главный цикл
     logging.info("🎮 Запуск (SPACE — пауза, ESC — выход)")
-    tick = 0; max_ticks = 6_000
+    tick = 0; max_ticks = 20_000
+    metrics.on_sim_start(tick=0)
+    _algo._metrics = metrics
+
+    from dispatcher import SubOrderStatus as _SOS
+
+    def _scenario_complete(tick: int) -> bool:
+        """
+        True когда сценарий завершён:
+          • Все заказы сгенерированы (tick ≥ max_spawn_tick ИЛИ
+            уже создано num_orders заказов)
+          • Все подзаказы всех заказов имеют статус COMPLETED
+        """
+        # Ещё не все заказы могли появиться
+        if (tick < config.get('max_spawn_tick', 5000)
+                and len(dispatcher.orders) < config.get('num_orders', 60)):
+            return False
+        # Нет ни одного заказа ещё
+        if not dispatcher.orders:
+            return False
+        # Проверяем все подзаказы
+        for order in dispatcher.orders.values():
+            for sub in order.suborders:
+                if sub.status != _SOS.COMPLETED:
+                    return False
+        return True
 
     try:
         while visual.running:
@@ -186,8 +216,7 @@ def main():
                     orders_by_packer[pid] = {'orders': []}
                 cur_sid = dispatcher.active_suborder_id.get(order.packer_id)
                 for sub in order.suborders:
-                    from dispatcher import SubOrderStatus
-                    if sub.status == SubOrderStatus.COMPLETED: continue
+                    if sub.status == _SOS.COMPLETED: continue
                     ic = {}
                     for item in sub.items:
                         ic[item.product_id] = ic.get(item.product_id, 0) + 1
@@ -220,9 +249,21 @@ def main():
             delay = config.get("tick_delay_ms", 0)
             if delay > 0:
                 time.sleep(delay / 1000.0)
+
+            # Условие остановки 1: все заказы выполнены
+            if _scenario_complete(tick):
+                logging.info(f"✅ Все заказы выполнены на тике {tick}. Завершаем.")
+                break
+
+            # Условие остановки 2: достигнут лимит тактов
             if tick >= max_ticks:
-                logging.info(f"🏁 Лимит {max_ticks} тактов достигнут."); break
+                logging.info(f"⏱ Лимит {max_ticks} тактов достигнут.")
+                break
     finally:
+        metrics.on_sim_end(tick)                  # ← финальный тик
+        saved = metrics.save_to_excel('results')  # ← сохранение
+        if saved:
+            logging.info(f"📊 Метрики: {saved}")
         pygame.quit()
         logging.info("✅ Симуляция завершена")
 

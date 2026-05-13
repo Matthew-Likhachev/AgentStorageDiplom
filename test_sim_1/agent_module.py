@@ -244,7 +244,8 @@ class AgentManager:
     def __init__(self, env, router: IRouter, map_data: Dict,
                  dispatcher=None, inventory=None,
                  packer_positions=None, packer_delivery_zones=None,
-                 num_agents: int = 2):
+                 num_agents: int = 2,
+                 metrics=None):          # MetricsCollector | None
         self.env                   = env
         self.router                = router
         self.dispatcher            = dispatcher
@@ -252,6 +253,7 @@ class AgentManager:
         self.packer_positions      = packer_positions      or {}
         self.packer_delivery_zones = packer_delivery_zones or {}
         self.num_agents            = num_agents
+        self.metrics               = metrics   # MetricsCollector
         self.agents: Dict[int, Agent] = {}
         self.current_tick          = 0
 
@@ -278,7 +280,8 @@ class AgentManager:
                     self.shelf_states[(c['row'], c['col'])] = 'ACTIVE'
 
         self.slot_manager      = PackerSlotManager(map_data)
-        self.deadlock_resolver = DeadlockResolver(stuck_threshold=8, map_data=map_data)
+        self.deadlock_resolver = DeadlockResolver(stuck_threshold=8, map_data=map_data,
+                                                  metrics=self.metrics)
 
         if self.dispatcher and hasattr(self.dispatcher, 'packer_slots'):
             for pid in self.slot_manager.slots:
@@ -795,6 +798,31 @@ class AgentManager:
     def run_tick(self) -> Dict[str, Any]:
         self.current_tick += 1
 
+        # Метрики: начало тика
+        if self.metrics:
+            self.metrics.on_tick_start(self.current_tick)
+            # Отслеживаем заказы и подзаказы через dispatcher
+            if self.dispatcher:
+                for order in self.dispatcher.orders.values():
+                    oid = order.order_id
+                    # Подсчитываем стеллажи в заказе (сумма по подзаказам)
+                    total_sh = sum(s.num_shelves for s in order.suborders)
+                    self.metrics.on_order_start(oid, self.current_tick, total_sh)
+                    for sub in order.suborders:
+                        self.metrics.on_suborder_start(
+                            sub.suborder_id, oid, self.current_tick, sub.num_shelves)
+                        # Подзаказ завершён
+                        from dispatcher import SubOrderStatus
+                        if sub.status == SubOrderStatus.COMPLETED:
+                            self.metrics.on_suborder_complete(
+                                sub.suborder_id, self.current_tick)
+                # Заказ завершён — все подзаказы COMPLETED
+                for order in self.dispatcher.orders.values():
+                    if all(s.status.value == 'completed'
+                           for s in order.suborders):
+                        self.metrics.on_order_complete(
+                            order.order_id, self.current_tick)
+
         # Заполняем reservations перед планированием.
         #
         # Классификация агентов по типу блокировки:
@@ -1129,6 +1157,9 @@ class AgentManager:
                         ag.unload_timer = 5
                         logging.info(f"  📦 Агент {ag.id} разгружается "
                                      f"(слот 1, фасовщик {_pid_gate})")
+                        # Метрика 6: фиксируем выход из очереди (начало разгрузки)
+                        if self.metrics:
+                            self.metrics.on_exit_packer_queue(ag.id, self.current_tick)
                     # else: ждём в слоте 1 — остаёмся STATUS_CARRY_TO_PACKER,
                     # следующий тик проверит снова когда переключится active_suborder_id
                 else:
@@ -1136,6 +1167,11 @@ class AgentManager:
                     ag.status = STATUS_WAITING_SLOT
                     logging.info(f"  ⏳ Агент {ag.id} ждёт в слоте "
                                  f"{ag.assigned_slot_num} @ {ag.pos}")
+                    # Метрика 6: фиксируем вход в очередь
+                    if self.metrics and ag.current_suborder:
+                        _oid = ag.current_suborder.suborder_id  # берём order_id через suborder
+                        _ord_id = getattr(ag.current_suborder, 'order_id', 0)
+                        self.metrics.on_enter_packer_queue(ag.id, _ord_id, self.current_tick)
                 ag.path = []
 
             elif ag.status == STATUS_RETURN_SHELF and ag.goal and ag.pos == ag.goal:
@@ -1347,6 +1383,10 @@ class AgentManager:
                 ag.current_path_index = 0
                 if self.router.is_centralized and hasattr(self.router, 'notify_blocked'):
                     self.router.notify_blocked(aid)
+                # Метрика 5: активный агент заблокирован Level-3
+                if self.metrics and ag.status in (
+                        STATUS_GO_TO_SHELF, STATUS_CARRY_TO_PACKER, STATUS_RETURN_SHELF):
+                    self.metrics.on_agent_blocked(aid, ag.status)
 
         # 6d. Физические смещения IDLE-агентов (уступили дорогу активному агенту).
         # IDLE не имеют путей от роутера → ag.move() их не затрагивает.
